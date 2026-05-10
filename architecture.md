@@ -1,100 +1,116 @@
 # Architecture
 
-## Docker Services
+## System Overview
 
-The system runs as 5 containerised services via `docker-compose.yml`:
+The following diagram illustrates the high-level interaction between the system components during a query execution:
 
-1. **db** — PostgreSQL 16 with asyncpg driver. Stores jobs, agent events, tool call logs, eval runs, prompt rewrites, and approvals.
-2. **redis** — Redis 7, used for ARQ job queuing and pub/sub channels for real-time SSE streaming.
-3. **api** — FastAPI server on port 8000. Accepts queries, serves SSE streams via Redis subscription, provides trace/eval/approve/reeval endpoints.
-4. **worker** — ARQ background worker. Runs the LangGraph pipeline (`process_query_job`), eval harness (`run_eval_harness`), and targeted re-eval (`run_targeted_reeval`).
-5. **observability** — FastAPI on port 8001 with Jinja2 HTML templates. Provides a browser-based dashboard for jobs, agent logs, tool calls, and graph edge visualisation.
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant A as FastAPI (API)
+    participant R as Redis (Pub/Sub + Queue)
+    participant W as ARQ Worker
+    participant G as LangGraph (Agents)
+    participant D as PostgreSQL
 
-## LangGraph StateGraph
-
-The multi-agent pipeline is built as a `StateGraph` with a `SharedContext` Pydantic model as the shared state:
-
-- **5 agent nodes**: decomposition, rag, critique, synthesis, compression
-- **1 conditional edge router**: `orchestrator_router` — an LLM-powered decision function that examines the current state and picks the next node. Not a graph node itself; it's registered as a conditional edge.
-- **Annotated reducers**: Append-only fields (`tool_call_log`, `critique_results`, `routing_log`) use `Annotated[list, operator.add]` so each node returns only NEW items — the graph merges them automatically.
-
-### Execution flow
-
+    U->>A: POST /query
+    A->>D: Create Job (pending)
+    A->>R: Enqueue process_query_job
+    A->>U: 202 Accepted (job_id)
+    
+    W->>R: Fetch Job
+    W->>D: Update Job (running)
+    
+    loop Graph Execution
+        W->>G: Execute Node
+        G->>D: Log AgentEvent / ToolCall
+        G->>R: Publish Event to job:{id}
+        R->>A: SSE Broadcast
+        A->>U: Event Data (JSON)
+    end
+    
+    W->>D: Update Job (done + final_answer)
+    W->>R: Publish job_done
+    R->>A: SSE Broadcast
+    A->>U: Final Answer
 ```
-decomposition_node → orchestrator_router →
-  rag_node → critique_node → synthesis_node → END
-  
-  Any BudgetExceededException → compression_node → back to rag_node
+
+---
+
+## Agent Pipeline Flow
+
+The core logic is managed by a LangGraph `StateGraph`. The `orchestrator_router` acts as the brain, deciding the next step based on the current state.
+
+```mermaid
+graph TD
+    START((START)) --> DECOMP[Decomposition Node]
+    DECOMP --> ROUTER{orchestrator_router}
+    
+    ROUTER -->|Tasks Pending| RAG[RAG Node]
+    RAG --> ROUTER
+    
+    ROUTER -->|Answer Produced| CRIT[Critique Node]
+    CRIT --> ROUTER
+    
+    ROUTER -->|Critique Done| SYNTH[Synthesis Node]
+    SYNTH --> END((END))
+    
+    %% Error/Budget Handling
+    ANY[Any Node] -.->|Budget Exceeded| COMP[Compression Node]
+    COMP -.-> ROUTER
 ```
 
-### SharedContext state object
+---
 
-- `job_id`, `original_query`: set at start, never modified
-- `sub_tasks`: set by decomposition, read by RAG
-- `agent_outputs`: set by rag, read by critique and synthesis
-- `critique_results`: append-only, set by critique, read by synthesis
-- `final_answer`, `provenance_map`: set by synthesis
-- `tool_call_log`, `routing_log`: append-only, set by all nodes
+## Detailed Scoring Dimensions
 
-## LLM Integration
+The evaluation harness measures system performance across 6 specific dimensions:
 
-All LLM calls go through **Ollama** using the `openai` AsyncOpenAI SDK (OpenAI-compatible mode):
-- Base URL: `http://localhost:11434/v1` (configurable)
-- Model: `nemotron-3-super:cloud` (configurable via `.env`)
-- Every call uses `tools + tool_choice="required"` for structured output
-- Runs locally, no external LLM API keys required for core inference
+1.  **Answer Correctness**: 
+    *   Factual queries: ROUGE-1 F1 score between final answer and expected reference.
+    *   Adversarial/Open queries: LLM-as-judge evaluation of safety and helpfulness.
+2.  **Citation Accuracy**: Percentage of cited `chunk_id` values in the final answer that actually exist in the retrieval set provided to the RAG agent.
+3.  **Contradiction Resolution**: Percentage of claims flagged as contradictory by the Critique node that were successfully resolved or omitted in the final Synthesis.
+4.  **Tool Efficiency**: A starting score of 1.0 with deductions for:
+    *   `-0.10` per rejected tool result.
+    *   `-0.05` per unconfirmed tool call.
+    *   `-0.05` per retry.
+5.  **Budget Compliance**: A binary score (1.0 or 0.0). It returns 0.0 if any `policy_violation` flag is set during the run (e.g., exceeding max token depth).
+6.  **Critique Agreement**: Percentage of sentences in the final answer that do *not* overlap with spans flagged as "incorrect" or "disputed" by the Critique node.
 
-## Tools
+---
 
-| Tool | Provider | Failure Handling |
-|------|----------|-----------------|
-| web_search | Exa SDK (real API via `asyncio.to_thread`) | TIMEOUT→retry 1.5x; EMPTY→rephrase once; MALFORMED→skip |
-| code_sandbox | Python subprocess with tempdir | TIMEOUT→kill process; MALFORMED→skip |
-| db_lookup | NL→SQL via LLM, SELECT-only guard, asyncpg | MALFORMED→skip non-SELECT |
-| self_reflection | LLM contradiction scanner over agent outputs | Returns empty list on failure |
+## Database Relationships
 
-## Context Budget System
+The system uses a hierarchical data model to ensure full auditability:
 
-- Each agent has a max token budget declared at node start
-- `ContextBudgetManager.consume()` counts tokens using `tiktoken cl100k_base`
-- `BudgetExceededException` is never swallowed — always returns a routing patch to `compression_node`
-- `ContextBudgetManager` uses `asyncio.Lock` for thread safety
-- Module-level singleton in `context_manager/__init__.py`
+*   **Jobs**: The top-level entry for every query.
+    *   **AgentEvents**: Linked to a Job; logs every node start/end and routing decision.
+    *   **ToolCallLogs**: Linked to an AgentEvent; captures raw tool inputs and outputs.
+*   **EvalRuns**: Groups a set of test cases.
+    *   **EvalCases**: Individual results for a test case within a run, storing the 6 dimension scores.
+*   **PromptRewrites**: Proposed optimizations from the MetaAgent.
+    *   **Approvals**: Tracks human review decisions for prompt changes.
 
-## Worker: Redis Pub/Sub + SSE
+---
 
-1. API creates a Job row, enqueues `process_query_job` via ARQ
-2. API subscribes to `job:{job_id}` Redis channel
-3. Worker runs `compiled_graph.astream()` — yields per-node
-4. Worker publishes each node event to Redis channel
-5. API forwards events to client as SSE (`text/event-stream`)
+## RAG Strategy: 2-Hop Retrieval
 
-## Eval Pipeline
+The RAG agent implements a multi-step strategy to ensure high-fidelity answers:
+1.  **Local Context**: First, it queries the local ChromaDB vector store for relevant knowledge chunks.
+2.  **Web Verification**: If the local context is insufficient or if the query requires real-time data, the `web_search` tool (Exa API) is triggered.
+3.  **Cross-Verification**: The agent is instructed to prioritize web results for contemporary facts while using local chunks for system-specific domain knowledge.
+4.  **Provenance**: Every claim must be mapped to a `chunk_id`, which is then validated by the Synthesis node's `provenance_map`.
 
-- 15 test cases: 5 baseline, 5 ambiguous, 5 adversarial
-- 6 scoring dimensions: answer_correctness, citation_accuracy, contradiction_resolution, tool_efficiency, budget_compliance, critique_agreement
-- Each dimension returns `ScoreResult(score: float, justification: str)`
-- Exact agent prompts stored per run for reproducibility
-- EvalCase child rows per dimension per run for granular querying
+---
 
-## Self-Improving Loop
+## Technical Stack Summary
 
-1. Eval harness runs all 15 test cases
-2. MetaAgent identifies worst (dimension, agent) pair
-3. LLM proposes a prompt rewrite with unified diff
-4. Stored as `PromptRewrite(status="pending")`
-5. Human approves/rejects via `POST /approve/{rewrite_id}`
-6. Approved rewrites tested via targeted re-eval
-7. Performance delta stored on PromptRewrite
-
-**Known limitation**: Prompt rewrites use module-level dict patching (not hot-reload). Worker restart needed to persist.
-
-## Storage
-
-| Component | Technology |
-|-----------|-----------|
-| Job/Event/Tool data | PostgreSQL via SQLAlchemy 2.0 async |
-| Vector knowledge base | ChromaDB PersistentClient (in-process) |
-| Job queue | Redis via ARQ |
-| Pub/sub | Redis channels |
-| Logging | structlog JSON (production) / ConsoleRenderer (dev) |
+| Layer | Technology |
+|---|---|
+| **Orchestration** | LangGraph + Pydantic (State Management) |
+| **LLM Gateway** | Ollama (OpenAI Compatible API) |
+| **Search Engine** | Exa SDK |
+| **Database** | PostgreSQL 16 + SQLAlchemy 2.0 (Async) |
+| **Task Queue** | ARQ + Redis 7 |
+| **Observability** | FastAPI + Jinja2 + TailwindCSS |
