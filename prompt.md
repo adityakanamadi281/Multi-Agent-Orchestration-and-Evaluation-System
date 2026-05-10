@@ -1,5 +1,7 @@
 # Multi-Agent LLM Orchestration System — Full Project Prompt
 
+## Full Project Prompt Instructions for coding agents  
+
 You are an expert LLM and Agentic AI engineer. Your task is to build and modify a
 production-grade multi-agent orchestration system. The full specification, architecture
 decisions, known bugs, and required fixes are described below. Follow every instruction
@@ -1491,3 +1493,7 @@ Before considering the implementation complete, verify:
 - [ ] All log lines contain `job_id`, `agent_id`, `event_type`, `latency_ms`
 - [ ] `POST /approve/{rewrite_id}` returns 409 on second call
 - [ ] Logviewer shows policy violations in red and rejected tool calls in amber
+
+
+
+
