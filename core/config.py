@@ -18,11 +18,11 @@ class Settings(BaseSettings):
     WEB_SEARCH_PRIMARY: str = "exa"
     WEB_SEARCH_MAX_RETRIES: int = 2
 
-    DATABASE_URL: str = "postgresql+asyncpg://multiagent:multiagent@localhost:5432/multiagent"
-    SYNC_DATABASE_URL: str = "postgresql://multiagent:multiagent@localhost:5432/multiagent"
-    POSTGRES_USER: str = "multiagent"
-    POSTGRES_PASSWORD: str = "multiagent"
-    POSTGRES_DB: str = "multiagent"
+    DATABASE_URL: str = "postgresql+asyncpg://user:pass@db:5432/postgres"
+    SYNC_DATABASE_URL: str = "postgresql://user:pass@db:5432/postgres"
+    POSTGRES_USER: str = "user"
+    POSTGRES_PASSWORD: str = "password"
+    POSTGRES_DB: str = "postgres"
 
     REDIS_URL: str = "redis://127.0.0.1:6379"
 
