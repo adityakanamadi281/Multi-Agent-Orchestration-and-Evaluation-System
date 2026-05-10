@@ -77,33 +77,89 @@ uv run uvicorn observability.app:app --reload --port 8001
 
 ```
 multi-agent-system/
-├── core/               # Foundation: Config, LLM factory, Logging
-│   ├── config.py       # pydantic-settings
-│   ├── llm.py          # Ollama/OpenAI factory
-│   └── logging.py      # structlog setup
-├── schemas/            # Data models (SharedContext, Eval, ToolResult)
-├── db/                 # Database layer
-│   ├── models.py       # SQLAlchemy tables
-│   ├── queries.py      # Async CRUD operations
-│   └── migrations/     # Alembic versions
-├── agents/             # Multi-agent logic
-│   ├── graph.py        # StateGraph wiring
-│   ├── router.py       # Conditional routing logic
-│   ├── decomposition.py, rag.py, critique.py, synthesis.py
-│   └── meta.py         # Self-improvement agent
-├── tools/              # Agent tools (web_search, code_sandbox, etc.)
-├── eval/               # Evaluation pipeline
-│   ├── test_cases.py   # Baseline, Ambiguous, Adversarial cases
-│   ├── scoring.py      # 6 scoring dimensions
-│   └── harness.py      # Execution & persistence
-├── api/                # FastAPI service
-│   ├── main.py         # App entry point
-│   └── routes/         # query, trace, eval, reeval, approve
-├── worker/             # ARQ background worker
-│   └── tasks.py        # Async job handlers
-└── observability/      # Monitoring dashboard
-    ├── app.py          # Dashboard API/Routes
-    └── templates/      # HTML/JS (Jobs, Logs, Tools, Evaluation)
+├── agents/
+│   ├── compression.py
+│   ├── critique.py
+│   ├── decomposition.py
+│   ├── graph.py
+│   ├── meta.py
+│   ├── prompts.py
+│   ├── rag.py
+│   ├── rag_chunks.py
+│   ├── router.py
+│   └── __init__.py
+├── api/
+│   ├── Dockerfile
+│   ├── dependencies.py
+│   ├── main.py
+│   ├── routes/
+│   │   ├── approve.py
+│   │   ├── eval.py
+│   │   ├── query.py
+│   │   ├── reeval.py
+│   │   ├── trace.py
+│   │   └── __init__.py
+│   ├── schemas/
+│   │   ├── responses.py
+│   │   └── __init__.py
+│   └── __init__.py
+├── context_manager/
+│   ├── budget.py
+│   └── __init__.py
+├── core/
+│   ├── config.py
+│   ├── llm.py
+│   ├── logging.py
+│   └── __init__.py
+├── db/
+│   ├── migrations/
+│   │   ├── env.py
+│   │   ├── script.py.mako
+│   │   └── versions/
+│   │       └── 0001_initial.py
+│   ├── models.py
+│   ├── queries.py
+│   └── __init__.py
+├── eval/
+│   ├── harness.py
+│   ├── scoring.py
+│   ├── test_cases.py
+│   ├── test_cases_data.py
+│   └── __init__.py
+├── observability/
+│   ├── Dockerfile
+│   ├── app.py
+│   ├── templates/
+│   │   └── index.html
+│   └── __init__.py
+├── schemas/
+│   ├── context.py
+│   ├── eval.py
+│   ├── tool_result.py
+│   └── __init__.py
+├── tools/
+│   ├── base.py
+│   ├── code_sandbox.py
+│   ├── db_lookup.py
+│   ├── self_reflection.py
+│   ├── tool_logger.py
+│   ├── web_search.py
+│   └── __init__.py
+├── worker/
+│   ├── Dockerfile
+│   ├── tasks.py
+│   └── __init__.py
+├── .dockerignore
+├── .env.example
+├── .gitignore
+├── .python-version
+├── alembic.ini
+├── architecture.md
+├── docker-compose.yml
+├── prompt.md
+├── pyproject.toml
+├── README.md
+└── uv.lock
 ```
 
 ---
