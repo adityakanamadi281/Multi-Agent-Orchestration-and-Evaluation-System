@@ -18,12 +18,12 @@ class Settings(BaseSettings):
     WEB_SEARCH_PRIMARY: str = "exa"
     WEB_SEARCH_MAX_RETRIES: int = 2
 
-    DATABASE_URL: str = "postgresql+asyncpg://user:pass@db:5432/postgres"
-    SYNC_DATABASE_URL: str = "postgresql://user:pass@db:5432/postgres"
+    DATABASE_URL: str = "postgresql+asyncpg://user:password@db:5432/postgres" 
+    SYNC_DATABASE_URL: str = "postgresql://user:password@db:5432/postgres"
     POSTGRES_USER: str = "user"
     POSTGRES_PASSWORD: str = "password"
     POSTGRES_DB: str = "postgres"
-
+    
     REDIS_URL: str = "redis://127.0.0.1:6379"
 
     CHROMA_PERSIST_DIR: str = "/data/chroma"
