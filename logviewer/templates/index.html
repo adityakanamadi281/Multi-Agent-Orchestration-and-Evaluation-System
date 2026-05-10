@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Multi-Agent System - Logviewer</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background: #1a1a2e; color: #e0e0e0; }
+h1 { color: #00d4ff; }
+.tabs { display: flex; gap: 4px; margin-bottom: 20px; }
+.tab { padding: 10px 20px; background: #16213e; border: 1px solid #0f3460; border-radius: 6px 6px 0 0; cursor: pointer; color: #a0a0a0; }
+.tab.active { background: #0f3460; color: #00d4ff; border-bottom-color: #0f3460; }
+.tab-content { display: none; background: #16213e; border: 1px solid #0f3460; border-radius: 0 6px 6px 6px; padding: 20px; min-height: 400px; }
+.tab-content.active { display: block; }
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #0f3460; font-size: 13px; }
+th { background: #0f3460; color: #00d4ff; }
+tr:hover { background: #1a2744; }
+input, select { padding: 8px 12px; background: #1a1a2e; border: 1px solid #0f3460; border-radius: 4px; color: #e0e0e0; margin-right: 8px; }
+button { padding: 8px 16px; background: #00d4ff; color: #1a1a2e; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+.edge-flow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 16px 0; }
+.edge-node { padding: 8px 16px; background: #0f3460; border-radius: 8px; color: #00d4ff; font-size: 13px; }
+.edge-arrow { color: #00d4ff; font-size: 18px; }
+.edge-reason { font-size: 11px; color: #888; max-width: 200px; }
+.status-pending { color: #ffa500; }
+.status-running { color: #00d4ff; }
+.status-done { color: #00ff88; }
+.status-failed { color: #ff4444; }
+</style>
+</head>
+<body>
+<h1>Multi-Agent System - Logviewer</h1>
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('jobs')">Jobs</div>
+  <div class="tab" onclick="switchTab('logs')">Agent Logs</div>
+  <div class="tab" onclick="switchTab('tools')">Tool Calls</div>
+  <div class="tab" onclick="switchTab('graph')">Graph Edges</div>
+</div>
+<div id="jobs" class="tab-content active">
+  <input type="text" id="jobSearch" placeholder="Filter by query...">
+  <button onclick="loadJobs()">Refresh</button>
+  <table id="jobsTable"><thead><tr><th>ID</th><th>Status</th><th>Query</th><th>Created</th></tr></thead><tbody></tbody></table>
+</div>
+<div id="logs" class="tab-content">
+  <input type="text" id="logJobId" placeholder="Job ID">
+  <select id="logAgentId"><option value="">All Agents</option></select>
+  <select id="logEventType"><option value="">All Events</option>
+    <option value="agent_start">agent_start</option><option value="agent_done">agent_done</option>
+    <option value="graph_edge">graph_edge</option><option value="policy_violation">policy_violation</option>
+  </select>
+  <button onclick="loadLogs()">Search</button>
+  <table id="logsTable"><thead><tr><th>Timestamp</th><th>Agent</th><th>Event</th><th>Latency</th><th>Tokens</th><th>Violation</th></tr></thead><tbody></tbody></table>
+</div>
+<div id="tools" class="tab-content">
+  <input type="text" id="toolJobId" placeholder="Job ID">
+  <select id="toolName"><option value="">All Tools</option></select>
+  <button onclick="loadTools()">Search</button>
+  <table id="toolsTable"><thead><tr><th>Timestamp</th><th>Agent</th><th>Tool</th><th>Latency</th><th>Accepted</th><th>Retries</th></tr></thead><tbody></tbody></table>
+</div>
+<div id="graph" class="tab-content">
+  <input type="text" id="graphJobId" placeholder="Job ID">
+  <button onclick="loadGraph()">Visualize</button>
+  <div id="graphFlow" class="edge-flow"></div>
+</div>
+<script>
+function switchTab(name) {
+  document.querySelectorAll('.tab-content').forEach(e => e.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(e => e.classList.remove('active'));
+  document.getElementById(name).classList.add('active');
+  document.querySelector(`.tab:nth-child(${['jobs','logs','tools','graph'].indexOf(name)+1})`).classList.add('active');
+}
+async function loadJobs() {
+  const r = await fetch('/logs');
+  const d = await r.json();
+  const jobs = {};
+  for (const l of d.logs) { if (l.job_id) jobs[l.job_id] = (jobs[l.job_id] || []).concat(l); }
+  const tbody = document.querySelector('#jobsTable tbody');
+  tbody.innerHTML = '';
+  for (const [jid, logs] of Object.entries(jobs)) {
+    const last = logs[logs.length-1] || {};
+    const status = last.event_type && last.event_type.includes('done') ? 'done' : 
+                   last.event_type && last.event_type.includes('failed') ? 'failed' : 'running';
+    tbody.innerHTML += `<tr><td>${jid.substring(0,8)}...</td>
+      <td class="status-${status}">${status}</td>
+      <td>${(last.job_id||'').substring(0,50)}</td><td>${last.timestamp||''}</td></tr>`;
+  }
+}
+async function loadLogs() {
+  const params = new URLSearchParams();
+  if (document.getElementById('logJobId').value) params.set('job_id', document.getElementById('logJobId').value);
+  if (document.getElementById('logAgentId').value) params.set('agent_id', document.getElementById('logAgentId').value);
+  if (document.getElementById('logEventType').value) params.set('event_type', document.getElementById('logEventType').value);
+  const r = await fetch('/logs?'+params);
+  const d = await r.json();
+  const tbody = document.querySelector('#logsTable tbody');
+  tbody.innerHTML = d.logs.map(l => `<tr>
+    <td>${(l.timestamp||'').substring(0,19)}</td><td>${l.agent_id||''}</td><td>${l.event_type||''}</td>
+    <td>${l.latency_ms||0}ms</td><td>${l.token_count||0}</td><td>${l.policy_violation?'YES':''}</td></tr>`).join('');
+}
+async function loadTools() {
+  const params = new URLSearchParams();
+  if (document.getElementById('toolJobId').value) params.set('job_id', document.getElementById('toolJobId').value);
+  const r = await fetch('/logs?'+params);
+  const d = await r.json();
+  const tools = d.logs.filter(l => l.event_type && l.event_type.startsWith('tool:'));
+  const tbody = document.querySelector('#toolsTable tbody');
+  tbody.innerHTML = tools.map(l => `<tr>
+    <td>${(l.timestamp||'').substring(0,19)}</td><td>${l.agent_id||''}</td><td>${(l.event_type||'').replace('tool:','')}</td>
+    <td>${l.latency_ms||0}ms</td><td>${l.accepted===true?'Yes':l.accepted===false?'No':'?'}</td><td>${l.retry_number||0}</td></tr>`).join('');
+}
+async function loadGraph() {
+  const jid = document.getElementById('graphJobId').value;
+  if (!jid) return;
+  const r = await fetch('/graph/'+jid);
+  const d = await r.json();
+  const div = document.getElementById('graphFlow');
+  div.innerHTML = d.edges.map((e,i) => 
+    `<span class="edge-node">${e.from_node||'start'}</span>
+     <span class="edge-arrow">-></span>
+     <span class="edge-node">${e.to_node||'end'}</span>
+     <span class="edge-reason">${(e.reasoning||'').substring(0,60)}</span>
+     ${i < d.edges.length-1 ? '<br>' : ''}`
+  ).join('');
+}
+loadJobs();
+</script>
+</body>
+</html>
