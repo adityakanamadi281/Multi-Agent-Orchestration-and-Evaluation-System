@@ -101,16 +101,18 @@ async def decomposition_node(state: SharedContext) -> dict:
         await budget_manager.consume(agent_id, json.dumps(args))
     except Exception as e:
         logger.error("decomposition_llm_error", error=str(e), job_id=job_id)
-        return {
-            "routing_log": [
+        # Fallback: Create a single research task so the pipeline can continue
+        args = {
+            "sub_tasks": [
                 {
-                    "next": "synthesis_node",
-                    "reason": f"Decomposition failed: {e}. Check if model '{settings.MODEL_NAME}' is pulled.",
-                    "agent": agent_id,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "id": "t1",
+                    "description": f"Research and answer: {state.original_query}",
+                    "type": "research",
+                    "depends_on": []
                 }
             ]
         }
+        await budget_manager.consume(agent_id, "fallback_task")
     sub_tasks_raw = args.get("sub_tasks", [])
 
     try:

@@ -104,10 +104,14 @@ async def orchestrator_router(state: SharedContext) -> str:
         ],
     )
 
-    decision = json.loads(
-        response.choices[0].message.tool_calls[0].function.arguments
-    )
-    next_node = decision["next_agent"]
+    try:
+        decision = json.loads(
+            response.choices[0].message.tool_calls[0].function.arguments
+        )
+        next_node = decision.get("next_agent", "synthesis_node")
+    except (json.JSONDecodeError, AttributeError, IndexError, KeyError):
+        next_node = "synthesis_node"
+        decision = {"next_agent": next_node, "reasoning": "Fallback due to LLM error"}
 
     asyncio.create_task(
         _write_routing_event(state.job_id, decision)
