@@ -8,7 +8,7 @@ The system runs as 5 containerised services via `docker-compose.yml`:
 2. **redis** — Redis 7, used for ARQ job queuing and pub/sub channels for real-time SSE streaming.
 3. **api** — FastAPI server on port 8000. Accepts queries, serves SSE streams via Redis subscription, provides trace/eval/approve/reeval endpoints.
 4. **worker** — ARQ background worker. Runs the LangGraph pipeline (`process_query_job`), eval harness (`run_eval_harness`), and targeted re-eval (`run_targeted_reeval`).
-5. **logviewer** — FastAPI on port 8001 with Jinja2 HTML templates. Provides a browser-based dashboard for jobs, agent logs, tool calls, and graph edge visualisation.
+5. **observability** — FastAPI on port 8001 with Jinja2 HTML templates. Provides a browser-based dashboard for jobs, agent logs, tool calls, and graph edge visualisation.
 
 ## LangGraph StateGraph
 

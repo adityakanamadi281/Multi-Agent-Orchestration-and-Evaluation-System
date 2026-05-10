@@ -60,9 +60,9 @@ uv run uvicorn api.main:app --reload --port 8000
 uv run arq worker.tasks.WorkerSettings
 ```
 
-**3. Log Viewer**
+**3. Observability Dashboard**
 ```bash
-uv run uvicorn logviewer.app:app --reload --port 8001
+uv run uvicorn observability.app:app --reload --port 8001
 ```
 
 ---
@@ -71,7 +71,7 @@ uv run uvicorn logviewer.app:app --reload --port 8001
 | What | URL |
 |---|---|
 | Swagger UI (interactive API) | http://localhost:8000/docs |
-| Logviewer dashboard | http://localhost:8001 |
+| Observability dashboard | http://localhost:8001 |
 | Health check | http://localhost:8000/health |
 
 ---
@@ -164,7 +164,7 @@ multi-agent-system/
 │   ├── Dockerfile
 │   └── tasks.py                # process_query_job, run_eval_harness, run_targeted_reeval, WorkerSettings
 │
-└── logviewer/                  # Log viewer dashboard (port 8001)
+└── observability/              # Observability dashboard (port 8001)
     ├── __init__.py
     ├── Dockerfile
     ├── app.py                  # FastAPI app, Jinja2 routes
@@ -489,7 +489,7 @@ Access at `http://localhost:8001` with 4 tabs:
 | `redis` | redis:7-alpine | — | Redis 7 |
 | `api` | custom (api/Dockerfile) | 8000 | uvicorn + alembic upgrade |
 | `worker` | custom (worker/Dockerfile) | — | ARQ worker (process_query_job, run_eval_harness, run_targeted_reeval) |
-| `logviewer` | custom (logviewer/Dockerfile) | 8001 | uvicorn logviewer |
+| `logviewer` | custom (observability/Dockerfile) | 8001 | uvicorn observability |
 
 ---
 

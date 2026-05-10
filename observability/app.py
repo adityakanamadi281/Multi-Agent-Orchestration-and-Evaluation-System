@@ -4,7 +4,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from pathlib import Path
 
-app = FastAPI(title="Logviewer", version="0.1.0")
+app = FastAPI(title="Observability", version="0.1.0")
 
 templates_dir = Path(__file__).parent / "templates"
 templates_dir.mkdir(exist_ok=True)
@@ -104,4 +104,3 @@ async def get_graph(job_id: str):
         })
 
     return {"edges": edges}
-

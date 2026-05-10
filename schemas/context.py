@@ -1,64 +1,65 @@
+from __future__ import annotations
 import operator
-from datetime import datetime
-from typing import Annotated, Literal
+import uuid
+from typing import Annotated, Optional
 from pydantic import BaseModel, Field
 
 
 class SubTask(BaseModel):
     id: str
     description: str
-    type: Literal["research", "code", "analysis", "synthesis"]
+    type: str = "factual"
     depends_on: list[str] = []
-    status: Literal["pending", "running", "done", "blocked"] = "pending"
-    result: str | None = None
+    status: str = "pending"
+    result: Optional[str] = None
 
 
 class CritiquedClaim(BaseModel):
-    span: str
-    source_agent: str
+    span_start: int
+    span_end: int
+    claim_text: str
     confidence: float
-    flagged: bool
-    reason: str
+    disagreement: Optional[str] = None
+    source_agent: str
 
 
 class AgentOutput(BaseModel):
     agent_id: str
     output: str
-    token_count: int
     citations: list[dict] = []
-    timestamp: datetime
+    metadata: dict = Field(default_factory=dict)
 
 
 class ToolCall(BaseModel):
     tool_name: str
+    agent_id: str
     input: dict
-    output: dict | None = None
-    latency_ms: int = 0
-    accepted: bool | None = None
+    output: dict = {}
+    status: str = "ok"
+    latency_ms: float = 0.0
     retry_number: int = 0
-    error_code: str | None = None
+    accepted: bool = True
+
+
+class RoutingEntry(BaseModel):
+    from_node: str
+    to_node: str
+    reasoning: str
+    timestamp: str
 
 
 class SharedContext(BaseModel):
-    """
-    LangGraph StateGraph state.
-    Append-only fields use Annotated[list, operator.add]:
-      nodes return only NEW items — the graph merges them.
-    All other fields are replaced by whatever the node returns.
-    Never mutate state in place inside a node.
-    """
+    job_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    original_query: str = ""
 
-    job_id: str
-    original_query: str
     sub_tasks: list[SubTask] = []
     agent_outputs: dict[str, AgentOutput] = {}
-    context_budget: dict[str, dict] = {}
-    final_answer: str | None = None
-    provenance_map: dict[str, dict] = {}
-
-    # Append-only — reducer concatenates lists across nodes
-    tool_call_log: Annotated[list[ToolCall], operator.add] = []
     critique_results: Annotated[list[CritiquedClaim], operator.add] = []
-    routing_log: Annotated[list[dict], operator.add] = []
+    final_answer: Optional[str] = None
+    provenance_map: dict = {}
 
+    tool_call_log: Annotated[list[ToolCall], operator.add] = []
+    routing_log: Annotated[list[RoutingEntry], operator.add] = []
 
+    budget_state: dict = {}
+    compression_triggered: bool = False

@@ -1,9 +1,15 @@
-import json
-import sys
 from datetime import datetime, timezone
-
 import structlog
 from core.config import settings
+
+
+_LOG_LEVELS = {
+    "DEBUG": 10,
+    "INFO": 20,
+    "WARNING": 30,
+    "ERROR": 40,
+    "CRITICAL": 50,
+}
 
 
 def _add_timestamp(logger, method_name, event_dict):
@@ -12,6 +18,7 @@ def _add_timestamp(logger, method_name, event_dict):
 
 
 def configure_logging():
+    log_level = _LOG_LEVELS.get(settings.LOG_LEVEL.upper(), 20)
     shared_processors = [
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,
@@ -19,7 +26,7 @@ def configure_logging():
         structlog.stdlib.ExtraAdder(),
     ]
 
-    if settings.LOG_LEVEL == "DEBUG":
+    if log_level <= _LOG_LEVELS["DEBUG"]:
         renderer = structlog.dev.ConsoleRenderer()
     else:
         renderer = structlog.processors.JSONRenderer()
@@ -33,9 +40,7 @@ def configure_logging():
             structlog.processors.UnicodeDecoder(),
             renderer,
         ],
-        wrapper_class=structlog.make_filtering_bound_logger(
-            getattr(__import__("logging"), settings.LOG_LEVEL.upper())
-        ),
+        wrapper_class=structlog.make_filtering_bound_logger(log_level),
         context_class=dict,
         logger_factory=structlog.PrintLoggerFactory(),
         cache_logger_on_first_use=True,
@@ -43,6 +48,7 @@ def configure_logging():
 
 
 configure_logging()
-logger = structlog.get_logger()
 
 
+def get_logger(name: str):
+    return structlog.get_logger(name)

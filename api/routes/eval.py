@@ -1,21 +1,19 @@
 from collections import defaultdict
-
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-
 from api.dependencies import get_db
-from api.schemas.responses import DimensionStats, ErrorResponse, EvalSummaryResponse
+from api.schemas.responses import DimensionStats, ErrorResponse, EvalSummaryResponse, ReevalResponse
 from db.queries import get_latest_eval_runs, get_pending_rewrites
+from arq import create_pool
+from arq.connections import RedisSettings
+from core.config import settings
+import uuid as _uuid
 
 router = APIRouter(tags=["Evaluation"])
 
 DIMENSIONS = [
-    "answer_correctness",
-    "citation_accuracy",
-    "contradiction_resolution",
-    "tool_efficiency",
-    "budget_compliance",
-    "critique_agreement",
+    "answer_correctness", "citation_accuracy", "contradiction_resolution",
+    "tool_efficiency", "budget_compliance", "critique_agreement",
 ]
 
 
@@ -44,20 +42,28 @@ async def get_latest_eval(db: AsyncSession = Depends(get_db)):
             pending_rewrites=0,
         )
 
+    from sqlalchemy import select
+    from db.models import EvalCase
+    run_ids = [r.id for r in runs]
+    result = await db.execute(
+        select(EvalCase).where(EvalCase.eval_run_id.in_(run_ids))
+    )
+    cases = list(result.scalars().all())
+
     run_group_id = str(runs[0].run_group_id)
     timestamp = runs[0].timestamp.isoformat() if runs[0].timestamp else None
 
     by_cat = defaultdict(lambda: defaultdict(list))
-    for run in runs:
+    for case in cases:
         for dim in DIMENSIONS:
-            sd = (run.scores or {}).get(dim, {})
+            sd = (case.scores or {}).get(dim, {})
             score = sd.get("score", 0.0) if isinstance(sd, dict) else float(sd)
-            by_cat[run.category][dim].append(score)
+            by_cat[case.category][dim].append(score)
 
     by_category = {}
     for cat, dims in by_cat.items():
         by_category[cat] = {
-            "count": len(runs),
+            "count": len(dims.get("answer_correctness", [])),
             "avg_scores": {
                 dim: round(sum(scores) / len(scores), 3)
                 for dim, scores in dims.items()
@@ -65,9 +71,9 @@ async def get_latest_eval(db: AsyncSession = Depends(get_db)):
         }
 
     by_dim = defaultdict(list)
-    for run in runs:
+    for case in cases:
         for dim in DIMENSIONS:
-            sd = (run.scores or {}).get(dim, {})
+            sd = (case.scores or {}).get(dim, {})
             score = sd.get("score", 0.0) if isinstance(sd, dict) else float(sd)
             by_dim[dim].append(score)
 
@@ -83,9 +89,25 @@ async def get_latest_eval(db: AsyncSession = Depends(get_db)):
     return EvalSummaryResponse(
         run_group_id=run_group_id,
         timestamp=timestamp,
-        total_cases=len(runs),
+        total_cases=len(cases),
         by_category=by_category,
         by_dimension=by_dimension,
         pending_rewrites=len(pending),
     )
 
+
+@router.post("/eval/run", response_model=ReevalResponse)
+async def trigger_eval():
+    """Trigger the full evaluation harness."""
+    arq_pool = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
+    try:
+        job_id = str(_uuid.uuid4())
+        await arq_pool.enqueue_job("run_eval_harness", _job_id=job_id)
+    finally:
+        await arq_pool.close()
+
+    return ReevalResponse(
+        reeval_job_id=job_id,
+        test_cases=15,  # Standard test suite size
+        status="queued",
+    )

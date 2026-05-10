@@ -6,11 +6,9 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
     volumes:
-      - pgdata:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
+      - pg_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
       interval: 5s
       retries: 10
 
@@ -20,46 +18,59 @@ services:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       retries: 10
-    ports:
-      - "6379:6379"
+
+  ollama:
+    image: ollama/ollama
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 10s
+      retries: 15
+      start_period: 30s
 
   api:
     build:
       context: .
       dockerfile: api/Dockerfile
-    depends_on:
-      db: { condition: service_healthy }
-      redis: { condition: service_healthy }
-    command: >
-      sh -c "uv run alembic upgrade head &&
-             uv run uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload"
-    ports: ["8000:8000"]
+    ports:
+      - "8000:8000"
     env_file: .env
-    volumes:
-      - chromadata:/data/chroma
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    command: sh -c "alembic upgrade head && uvicorn api.main:app --host 0.0.0.0 --port 8000"
 
   worker:
     build:
       context: .
       dockerfile: worker/Dockerfile
-    depends_on:
-      db: { condition: service_healthy }
-      redis: { condition: service_healthy }
-    command: uv run python -m arq worker.tasks.WorkerSettings
     env_file: .env
-    volumes:
-      - chromadata:/data/chroma
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    command: python -m arq worker.tasks.WorkerSettings
 
-  logviewer:
+  observability:
     build:
       context: .
-      dockerfile: logviewer/Dockerfile
-    depends_on:
-      db: { condition: service_healthy }
-    command: uv run uvicorn logviewer.app:app --host 0.0.0.0 --port 8001
-    ports: ["8001:8001"]
+      dockerfile: observability/Dockerfile
+    ports:
+      - "8001:8001"
     env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+    command: uv run uvicorn observability.app:app --host 0.0.0.0 --port 8001
 
 volumes:
-  pgdata:
-  chromadata:
+  pg_data:
+  ollama_data:

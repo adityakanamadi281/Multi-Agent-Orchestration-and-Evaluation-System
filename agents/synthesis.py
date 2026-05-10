@@ -1,13 +1,15 @@
-from core.config import settings
+import asyncio
 import json
 import uuid
-import asyncio
-from datetime import datetime, timezone
-from core.llm import get_client
-from core.logging import logger
-from context_manager import budget_manager
-from schemas.context import SharedContext
+from datetime import UTC, datetime
+
 from agents.prompts import AGENT_PROMPTS
+from context_manager import get_manager
+from core.config import settings
+from core.llm import get_llm_client as get_client
+from core.logging import get_logger
+logger = get_logger(__name__)
+from schemas.context import SharedContext
 
 SYNTHESIS_TOOL = {
     "type": "function",
@@ -58,16 +60,17 @@ SYNTHESIS_TOOL = {
 MAX_TOKENS = 8000
 
 
-async def synthesis_node(state: SharedContext) -> dict:
-    agent_id = "synthesis"
+async def run(state: SharedContext) -> dict:
+    agent_id = "synthesis_node"
     job_id = state.job_id
 
-    await budget_manager.declare_budget(agent_id, MAX_TOKENS)
+    mgr = await get_manager(job_id)
+    await mgr.declare_budget(agent_id, MAX_TOKENS)
 
     flagged_spans = [
-        {"span": c.span, "reason": c.reason, "source_agent": c.source_agent}
+        {"span": c.claim_text, "reason": c.disagreement, "source_agent": c.source_agent}
         for c in state.critique_results
-        if c.flagged
+        if c.disagreement
     ]
 
     outputs_summary = {}
@@ -83,9 +86,9 @@ async def synthesis_node(state: SharedContext) -> dict:
         response = await client.chat.completions.create(
             model=settings.MODEL_NAME,
             tools=[SYNTHESIS_TOOL],
-            tool_choice="required",
+            tool_choice="auto",
             messages=[
-                {"role": "system", "content": AGENT_PROMPTS["synthesis"]},
+                {"role": "system", "content": AGENT_PROMPTS[agent_id] + "\n\nIMPORTANT: You must use the 'produce_final_answer' tool to provide the structured final answer."},
                 {
                     "role": "user",
                     "content": (
@@ -100,21 +103,28 @@ async def synthesis_node(state: SharedContext) -> dict:
             max_tokens=MAX_TOKENS,
         )
 
-        if not response.choices[0].message.tool_calls:
-            raise ValueError(f"Model {settings.MODEL_NAME} failed to return tool calls for synthesis.")
+        message = response.choices[0].message
+        if message.tool_calls:
+            args = json.loads(message.tool_calls[0].function.arguments)
+        elif message.content:
+            args = {
+                "final_answer": message.content,
+                "provenance_map": {},
+                "resolved_contradictions": []
+            }
+            logger.warning("synthesis_llm_fallback_to_content", agent_id=agent_id, job_id=job_id)
+        else:
+            raise ValueError(f"Model {settings.MODEL_NAME} returned neither a tool call nor content for synthesis.")
 
-        args = json.loads(
-            response.choices[0].message.tool_calls[0].function.arguments
-        )
-        await budget_manager.consume(agent_id, json.dumps(args))
+        await mgr.consume(agent_id, json.dumps(args))
     except Exception as e:
         logger.error("synthesis_llm_failed", agent_id=agent_id, error=str(e))
         return {
             "routing_log": [{
-                "next": "END",
-                "reason": f"Synthesis failed: {e}. Check model '{settings.MODEL_NAME}'.",
-                "agent": agent_id,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "from_node": agent_id,
+                "to_node": "END",
+                "reasoning": f"Synthesis failed: {e}. Check model '{settings.MODEL_NAME}'.",
+                "timestamp": datetime.now(UTC).isoformat(),
             }]
         }
 
@@ -130,27 +140,29 @@ async def synthesis_node(state: SharedContext) -> dict:
             )
 
     async def _write_event():
-        from db.queries import write_agent_event
         from db import AsyncSessionLocal
+        from db.queries import write_agent_event, sha256_hex
         async with AsyncSessionLocal() as session:
-            from db.models import Job
             from sqlalchemy import update
-            from db.queries import sha256_hex
-            await write_agent_event(
-                session=session,
-                job_id=uuid.UUID(job_id),
-                agent_id=agent_id,
-                event_type="agent_done",
-                input_hash=sha256_hex(list(outputs_summary.keys())),
-                output_hash=sha256_hex(args.get("final_answer", "")),
-                payload=args,
-            )
-            await session.execute(
-                update(Job)
-                .where(Job.id == uuid.UUID(job_id))
-                .values(final_answer=args.get("final_answer", ""))
-            )
-            await session.commit()
+            from db.models import Job
+            try:
+                await write_agent_event(
+                    session=session,
+                    job_id=uuid.UUID(job_id),
+                    agent_id=agent_id,
+                    event_type="agent_done",
+                    input_hash=sha256_hex(list(outputs_summary.keys())),
+                    output_hash=sha256_hex(args.get("final_answer", "")),
+                    payload=args,
+                )
+                await session.execute(
+                    update(Job)
+                    .where(Job.id == uuid.UUID(job_id))
+                    .values(final_answer=args.get("final_answer", ""))
+                )
+                await session.commit()
+            except Exception as e:
+                logger.warning("failed_to_write_synthesis_event", job_id=job_id, error=str(e))
 
     asyncio.create_task(_write_event())
 
@@ -158,14 +170,9 @@ async def synthesis_node(state: SharedContext) -> dict:
         "final_answer": args.get("final_answer"),
         "provenance_map": args.get("provenance_map", {}),
         "routing_log": [{
-            "next": "END",
-            "reason": f"Synthesis complete with {len(resolved_spans)} contradictions resolved",
-            "agent": agent_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "from_node": agent_id,
+            "to_node": "END",
+            "reasoning": f"Synthesis complete with {len(resolved_spans)} contradictions resolved",
+            "timestamp": datetime.now(UTC).isoformat(),
         }],
     }
-
-
-
-
-

@@ -10,14 +10,6 @@ class BudgetExceededException(Exception):
 
 
 class ContextBudgetManager:
-    """
-    Thread-safe token budget tracker.
-    declare_budget() must be called before consume() for any agent.
-    consume() raises BudgetExceededException — never silently truncates.
-    Caller must catch the exception and return a routing patch to
-    compression_node. Swallowing it silently is a policy violation.
-    """
-
     def __init__(self):
         self._enc = tiktoken.get_encoding("cl100k_base")
         self._budgets: dict[str, dict] = {}
@@ -29,12 +21,14 @@ class ContextBudgetManager:
 
     async def check_remaining(self, agent_id: str) -> int:
         async with self._lock:
-            b = self._budgets[agent_id]
-            return b["max"] - b["used"]
+            b = self._budgets.get(agent_id, {})
+            return b.get("max", 0) - b.get("used", 0)
 
     async def consume(self, agent_id: str, text: str) -> int:
         tokens = len(self._enc.encode(text))
         async with self._lock:
+            if agent_id not in self._budgets:
+                raise ValueError(f"Budget not declared for agent: {agent_id}")
             b = self._budgets[agent_id]
             new_used = b["used"] + tokens
             if new_used > b["max"]:
@@ -42,10 +36,20 @@ class ContextBudgetManager:
             b["used"] = new_used
         return tokens
 
+    async def reset_budget(self, agent_id: str) -> None:
+        async with self._lock:
+            if agent_id in self._budgets:
+                self._budgets[agent_id]["used"] = 0
+
+    async def reset_all(self) -> None:
+        async with self._lock:
+            for b in self._budgets.values():
+                b["used"] = 0
+
     async def is_over_budget(self, agent_id: str) -> bool:
         async with self._lock:
-            b = self._budgets[agent_id]
-            return b["used"] >= b["max"]
+            b = self._budgets.get(agent_id, {})
+            return b.get("used", 0) >= b.get("max", 1)
 
     async def get_all_budgets(self) -> dict[str, dict]:
         async with self._lock:

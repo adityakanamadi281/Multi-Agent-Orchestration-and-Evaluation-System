@@ -1,61 +1,67 @@
 import asyncio
-import sys
+import os
 import tempfile
 import time
-from pathlib import Path
-from tools.base import BaseTool
-from schemas.tool_result import ToolResult, ErrorCode
+from schemas.tool_result import ToolResult
+from core.config import settings
 
 
-class CodeSandboxTool(BaseTool):
-    name = "code_sandbox"
+class CodeSandboxTool:
+    async def run(self, code: str, timeout_seconds: int | None = None) -> ToolResult:
+        timeout = timeout_seconds or settings.CODE_SANDBOX_TIMEOUT_SEC
 
-    async def _execute(self, input: dict) -> ToolResult:
-        code = input.get("code", "").strip()
-        timeout = float(input.get("timeout_seconds", 10.0))
-
-        if not code:
+        if not code or not code.strip():
             return ToolResult(
-                success=False,
-                error_code=ErrorCode.MALFORMED,
-                error_message="code must be non-empty",
+                status="malformed",
+                payload={"error": "empty code string"},
+                latency_ms=0.0,
+                retry_count=0,
             )
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            script = Path(tmpdir) / "script.py"
-            script.write_text(code, encoding="utf-8")
-            start = time.monotonic()
+        start = time.monotonic()
+        tmp_path = None
+        process = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
+                f.write(code)
+                tmp_path = f.name
+
+            process = await asyncio.create_subprocess_exec(
+                "python",
+                tmp_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    sys.executable,
-                    str(script),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=tmpdir,
-                )
                 stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout
+                    process.communicate(),
+                    timeout=timeout,
                 )
-                elapsed = int((time.monotonic() - start) * 1000)
                 return ToolResult(
-                    success=True,
-                    data={
+                    status="ok",
+                    payload={
                         "stdout": stdout.decode(errors="replace"),
                         "stderr": stderr.decode(errors="replace"),
-                        "exit_code": proc.returncode,
-                        "execution_time_ms": elapsed,
+                        "exit_code": process.returncode,
+                        "execution_time_ms": (time.monotonic() - start) * 1000,
                     },
+                    latency_ms=(time.monotonic() - start) * 1000,
+                    retry_count=0,
                 )
             except asyncio.TimeoutError:
-                proc.kill()
+                process.kill()
+                await process.wait()
                 return ToolResult(
-                    success=False,
-                    error_code=ErrorCode.TIMEOUT,
-                    error_message="code execution timed out",
-                    data={
-                        "stdout": "",
-                        "stderr": "timeout",
-                        "exit_code": -1,
-                    },
+                    status="timeout",
+                    payload={"error": f"execution exceeded {timeout}s", "exit_code": -1},
+                    latency_ms=(time.monotonic() - start) * 1000,
+                    retry_count=0,
                 )
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
+    async def execute(self, input: dict) -> ToolResult:
+        code = input.get("code", "")
+        timeout = input.get("timeout_seconds")
+        return await self.run(code, timeout)

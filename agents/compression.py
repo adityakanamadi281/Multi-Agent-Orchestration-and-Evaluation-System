@@ -1,13 +1,15 @@
-from core.config import settings
+import asyncio
 import json
 import uuid
-import asyncio
-from datetime import datetime, timezone
-from core.llm import get_client
-from core.logging import logger
-from context_manager import budget_manager
-from schemas.context import SharedContext
+from datetime import UTC, datetime
+
 from agents.prompts import AGENT_PROMPTS
+from context_manager import get_manager
+from core.config import settings
+from core.llm import get_llm_client as get_client
+from core.logging import get_logger
+logger = get_logger(__name__)
+from schemas.context import SharedContext
 
 COMPRESSION_TOOL = {
     "type": "function",
@@ -22,12 +24,12 @@ COMPRESSION_TOOL = {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "next": {"type": "string"},
-                            "reason": {"type": "string"},
-                            "agent": {"type": "string"},
+                            "from_node": {"type": "string"},
+                            "to_node": {"type": "string"},
+                            "reasoning": {"type": "string"},
                             "timestamp": {"type": "string"},
                         },
-                        "required": ["next", "reason", "agent", "timestamp"],
+                        "required": ["from_node", "to_node", "reasoning", "timestamp"],
                     },
                 },
                 "token_reduction_pct": {
@@ -43,16 +45,17 @@ COMPRESSION_TOOL = {
 MAX_TOKENS = 4000
 
 
-async def compression_node(state: SharedContext) -> dict:
-    agent_id = "compression"
+async def run(state: SharedContext) -> dict:
+    agent_id = "compression_node"
     job_id = state.job_id
 
-    await budget_manager.declare_budget(agent_id, MAX_TOKENS)
+    mgr = await get_manager(job_id)
+    await mgr.declare_budget(agent_id, MAX_TOKENS)
 
     overflowing_agents = [
-        entry.get("agent", "unknown")
+        entry.from_node
         for entry in state.routing_log
-        if entry.get("next") == "compression_node"
+        if entry.to_node == "compression_node"
     ]
     overflowing_agent = overflowing_agents[-1] if overflowing_agents else "rag_node"
 
@@ -64,25 +67,30 @@ async def compression_node(state: SharedContext) -> dict:
             "output": tc.output,
         })
 
-    routing_log_json = json.dumps(
-        [{"next": r.get("next"), "reason": r.get("reason", ""),
-          "agent": r.get("agent", ""), "timestamp": r.get("timestamp", "")}
-         for r in state.routing_log]
-    )
+    routing_log_entries = [
+        {
+            "from_node": r.from_node,
+            "to_node": r.to_node,
+            "reasoning": r.reasoning,
+            "timestamp": r.timestamp,
+        }
+        for r in state.routing_log
+        if hasattr(r, "from_node")
+    ]
 
     client = get_client()
 
     try:
         response = await client.chat.completions.create(
-            model=settings.MODEL_NAME,  
+            model=settings.MODEL_NAME,
             tools=[COMPRESSION_TOOL],
             tool_choice="required",
             messages=[
-                {"role": "system", "content": AGENT_PROMPTS["compression"]},
+                {"role": "system", "content": AGENT_PROMPTS[agent_id]},
                 {
                     "role": "user",
                     "content": (
-                        f"Routing log to compress:\n{routing_log_json}\n\n"
+                        f"Routing log to compress:\n{json.dumps(routing_log_entries, indent=2)}\n\n"
                         f"Lossless data (preserve verbatim):\n{json.dumps(lossless_data, indent=2)[:2000]}"
                     ),
                 },
@@ -92,10 +100,10 @@ async def compression_node(state: SharedContext) -> dict:
         logger.error("compression_llm_failed", agent_id=agent_id, error=str(e))
         return {
             "routing_log": [{
-                "next": "rag_node",
-                "reason": f"Compression failed, proceeding without compression: {e}",
-                "agent": agent_id,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "from_node": agent_id,
+                "to_node": "rag_node",
+                "reasoning": f"Compression failed, proceeding without compression: {e}",
+                "timestamp": datetime.now(UTC).isoformat(),
             }]
         }
 
@@ -104,44 +112,38 @@ async def compression_node(state: SharedContext) -> dict:
     )
     compressed = args.get("compressed_entries", [])
 
-    await budget_manager.declare_budget(overflowing_agent, MAX_TOKENS)
-
     async def _write_event():
-        from db.queries import write_agent_event
         from db import AsyncSessionLocal
+        from db.queries import write_agent_event, sha256_hex
         async with AsyncSessionLocal() as session:
-            from db.queries import sha256_hex
-            await write_agent_event(
-                session=session,
-                job_id=uuid.UUID(job_id),
-                agent_id=agent_id,
-                event_type="agent_done",
-                input_hash=sha256_hex({"overflowing_agent": overflowing_agent}),
-                output_hash=sha256_hex({"compressed_count": len(compressed)}),
-                payload={
-                    "overflowing_agent": overflowing_agent,
-                    "compressed_entries": compressed,
-                    "token_reduction_pct": args.get("token_reduction_pct", 0),
-                },
-            )
+            try:
+                await write_agent_event(
+                    session=session,
+                    job_id=uuid.UUID(job_id),
+                    agent_id=agent_id,
+                    event_type="agent_done",
+                    input_hash=sha256_hex({"overflowing_agent": overflowing_agent}),
+                    output_hash=sha256_hex({"compressed_count": len(compressed)}),
+                    payload={
+                        "overflowing_agent": overflowing_agent,
+                        "compressed_entries": compressed,
+                        "token_reduction_pct": args.get("token_reduction_pct", 0),
+                    },
+                )
+            except Exception:
+                pass
 
     asyncio.create_task(_write_event())
 
-    new_budgets = await budget_manager.get_all_budgets()
-
     return {
-        "context_budget": new_budgets,
-        "routing_log": compressed + [{
-            "next": "rag_node",
-            "reason": (
+        "context_budget": {},
+        "routing_log": [{"_replace_all": True}] + compressed + [{
+            "from_node": agent_id,
+            "to_node": "rag_node",
+            "reasoning": (
                 f"Compressed routing_log for {overflowing_agent}, "
                 f"reduced {args.get('token_reduction_pct', 0):.0f}%"
             ),
-            "agent": agent_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         }],
     }
-
-
-
-

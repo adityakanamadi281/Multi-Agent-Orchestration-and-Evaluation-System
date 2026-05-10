@@ -1,13 +1,12 @@
-from core.config import settings
 import difflib
 import json
 import uuid
-from datetime import datetime, timezone
 
-from core.llm import get_client
-from core.logging import logger
 from agents.prompts import AGENT_PROMPTS
-from schemas.eval import ScoreResult
+from core.config import settings
+from core.llm import get_llm_client as get_client
+from core.logging import get_logger
+logger = get_logger(__name__)
 
 META_TOOL = {
     "type": "function",
@@ -41,12 +40,10 @@ class MetaAgent:
 
     async def run(self):
         from db import AsyncSessionLocal
-        from db.queries import get_eval_runs_by_group, save_prompt_rewrite
+        from db.queries import get_latest_eval_runs, save_prompt_rewrite
 
         async with AsyncSessionLocal() as session:
-            eval_runs = await get_eval_runs_by_group(
-                session, uuid.UUID(self.run_group_id)
-            )
+            eval_runs = await get_latest_eval_runs(session)
 
         if not eval_runs:
             logger.warning("meta_agent_no_eval_runs", run_group_id=self.run_group_id)

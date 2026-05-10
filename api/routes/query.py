@@ -1,11 +1,9 @@
 import json
 import uuid
 from datetime import UTC, datetime
-
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-
 from api.dependencies import get_db
 from api.schemas.responses import ErrorResponse, QueryQueued, QueryRequest
 from db.queries import create_job
@@ -31,36 +29,36 @@ async def submit_query(request: QueryRequest, db: AsyncSession = Depends(get_db)
     from arq import create_pool
     from arq.connections import RedisSettings
     from core.config import settings
+    import redis.asyncio as aioredis
 
     arq_pool = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
-    await arq_pool.enqueue_job("process_query_job", str(job_id), request.query)
+    try:
+        await arq_pool.enqueue_job("process_query_job", str(job_id), request.query)
+    except Exception:
+        await arq_pool.close()
+        raise
 
     if not request.stream:
         await arq_pool.close()
-        return QueryQueued(job_id=str(job_id), status="queued")
+        return QueryQueued(job_id=str(job_id), status="pending")
 
     await arq_pool.close()
+    r = aioredis.from_url(settings.REDIS_URL)
 
     async def event_generator():
-        import redis.asyncio as aioredis
-
-        r = aioredis.from_url(settings.REDIS_URL)
         pubsub = r.pubsub()
         channel = f"job:{job_id}"
         await pubsub.subscribe(channel)
 
         yield (
             "data: "
-            + json.dumps(
-                {
-                    "job_id": str(job_id),
-                    "agent_id": "system",
-                    "event_type": "job_queued",
-                    "data": {"query": request.query},
-                    "context_budget_remaining": {},
-                    "timestamp": datetime.now(UTC).isoformat(),
-                }
-            )
+            + json.dumps({
+                "job_id": str(job_id),
+                "agent_id": "system",
+                "event_type": "job_queued",
+                "data": {"query": request.query},
+                "timestamp": datetime.now(UTC).isoformat(),
+            })
             + "\n\n"
         )
 
@@ -74,9 +72,8 @@ async def submit_query(request: QueryRequest, db: AsyncSession = Depends(get_db)
                 yield f"data: {raw}\n\n"
                 try:
                     parsed = json.loads(raw)
-                    if parsed.get("event_type") in ("agent_done", "job_done", "job_failed"):
-                        if parsed.get("agent_id") == "synthesis" or parsed.get("event_type") in ("job_done", "job_failed"):
-                            break
+                    if parsed.get("event_type") in ("job_done", "job_failed"):
+                        break
                 except Exception:
                     pass
         finally:
@@ -86,10 +83,5 @@ async def submit_query(request: QueryRequest, db: AsyncSession = Depends(get_db)
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-        },
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
-

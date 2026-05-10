@@ -2,9 +2,9 @@ import hashlib
 import json
 import uuid
 from datetime import datetime, UTC
-from sqlalchemy import select, update, func
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from db.models import AgentEvent, EvalRun, Job, PromptRewrite, ToolCallLog, EvalCase, Approval
+from db.models import AgentEvent, Approval, EvalCase, EvalRun, Job, PromptRewrite, ToolCallLog
 
 
 def sha256_hex(data: dict | str) -> str:
@@ -13,16 +13,21 @@ def sha256_hex(data: dict | str) -> str:
             return obj.isoformat()
         raise TypeError(f"Type {type(obj)} not serializable")
 
-    # Serialize if not a string (handles dicts, lists, etc.)
     raw = json.dumps(data, sort_keys=True, default=json_serial) if not isinstance(data, str) else data
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
 async def create_job(session: AsyncSession, job_id: uuid.UUID, query: str) -> Job:
-    job = Job(id=job_id, query=query, status="pending")
-    session.add(job)
+    from sqlalchemy import text
+    result = await session.execute(
+        text("INSERT INTO jobs (id, query, status) VALUES (:id, :query, 'pending'::job_status) RETURNING created_at"),
+        {"id": job_id, "query": query}
+    )
+    row = result.fetchone()
     await session.commit()
-    await session.refresh(job)
+    job = Job(id=job_id, query=query, status="pending")
+    if row:
+        job.created_at = row[0]
     return job
 
 
@@ -33,12 +38,14 @@ async def update_job_status(
     final_answer: str | None = None,
     completed_at: datetime | None = None,
 ) -> None:
-    values: dict = {"status": status}
+    from sqlalchemy import text
+    completed_val = completed_at or datetime.now(UTC)
     if status in ("done", "failed"):
-        values["completed_at"] = completed_at or datetime.now(UTC)
-    if final_answer is not None:
-        values["final_answer"] = final_answer
-    await session.execute(update(Job).where(Job.id == job_id).values(**values))
+        sql = f"UPDATE jobs SET status = '{status}'::job_status, completed_at = :completed_at, final_answer = COALESCE(:final_answer, final_answer) WHERE id = :job_id"
+        await session.execute(text(sql), {"completed_at": completed_val, "final_answer": final_answer, "job_id": job_id})
+    else:
+        sql = f"UPDATE jobs SET status = '{status}'::job_status, final_answer = COALESCE(:final_answer, final_answer) WHERE id = :job_id"
+        await session.execute(text(sql), {"final_answer": final_answer, "job_id": job_id})
     await session.commit()
 
 
@@ -61,7 +68,7 @@ async def write_agent_event(
     event_type: str,
     input_hash: str,
     output_hash: str | None = None,
-    latency_ms: int = 0,
+    latency_ms: float = 0.0,
     token_count: int = 0,
     payload: dict | None = None,
     policy_violation: bool = False,
@@ -113,7 +120,7 @@ async def write_tool_call_log(
     tool_name: str,
     input: dict,
     output: dict | None,
-    latency_ms: int,
+    latency_ms: float,
     accepted: bool | None,
     retry_number: int = 0,
 ) -> ToolCallLog:
@@ -188,13 +195,6 @@ async def get_latest_eval_runs(session: AsyncSession) -> list[EvalRun]:
     return list(result.scalars().all())
 
 
-async def get_eval_runs_by_group(session: AsyncSession, run_group_id: uuid.UUID) -> list[EvalRun]:
-    result = await session.execute(
-        select(EvalRun).where(EvalRun.run_group_id == run_group_id)
-    )
-    return list(result.scalars().all())
-
-
 async def get_eval_cases(session: AsyncSession, eval_run_id: uuid.UUID) -> list[EvalCase]:
     result = await session.execute(
         select(EvalCase).where(EvalCase.eval_run_id == eval_run_id)
@@ -216,13 +216,22 @@ async def get_rewrite_by_id(session: AsyncSession, rewrite_id: uuid.UUID) -> Pro
     return result.scalar_one_or_none()
 
 
-async def get_pending_rewrites(session: AsyncSession) -> list[PromptRewrite]:
+async def get_latest_approved_prompt(session: AsyncSession, agent_id: str) -> PromptRewrite | None:
     result = await session.execute(
         select(PromptRewrite)
-        .where(PromptRewrite.status == "pending")
-        .order_by(PromptRewrite.proposed_at)
+        .where(PromptRewrite.agent_id == agent_id, PromptRewrite.status == "approved")
+        .order_by(PromptRewrite.decided_at.desc())
+        .limit(1)
     )
-    return list(result.scalars().all())
+    return result.scalar_one_or_none()
+
+
+async def get_pending_rewrites(session: AsyncSession) -> list[PromptRewrite]:
+    from sqlalchemy import text
+    result = await session.execute(
+        text("SELECT * FROM prompt_rewrites WHERE status = 'pending' ORDER BY proposed_at")
+    )
+    return [PromptRewrite(**dict(row._mapping)) for row in result.fetchall()]
 
 
 async def approve_rewrite(
@@ -236,9 +245,7 @@ async def approve_rewrite(
     rewrite.status = "approved"
     rewrite.decided_at = datetime.now(UTC)
     rewrite.decided_by = decided_by
-    approval = Approval(
-        rewrite_id=rewrite_id, decision="approved", decided_by=decided_by
-    )
+    approval = Approval(rewrite_id=rewrite_id, decision="approved", decided_by=decided_by)
     session.add(approval)
     await session.commit()
     await session.refresh(rewrite)
@@ -256,20 +263,8 @@ async def reject_rewrite(
     rewrite.status = "rejected"
     rewrite.decided_at = datetime.now(UTC)
     rewrite.decided_by = decided_by
-    approval = Approval(
-        rewrite_id=rewrite_id, decision="rejected", decided_by=decided_by
-    )
+    approval = Approval(rewrite_id=rewrite_id, decision="rejected", decided_by=decided_by)
     session.add(approval)
     await session.commit()
     await session.refresh(rewrite)
     return rewrite
-
-
-async def get_approved_rewrites(session: AsyncSession) -> list[PromptRewrite]:
-    result = await session.execute(
-        select(PromptRewrite)
-        .where(PromptRewrite.status == "approved")
-        .order_by(PromptRewrite.proposed_at)
-    )
-    return list(result.scalars().all())
-

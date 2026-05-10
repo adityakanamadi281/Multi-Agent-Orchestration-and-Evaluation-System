@@ -1,19 +1,21 @@
-from core.config import settings
 import json
-import uuid
-import asyncio
 from datetime import datetime, timezone
-from core.llm import get_client
-from core.logging import logger
-from context_manager import budget_manager
+from context_manager import get_manager
+from context_manager.budget import BudgetExceededException
+from core.llm import llm_call
+from core.logging import get_logger
 from schemas.context import SharedContext, CritiquedClaim
 from agents.prompts import AGENT_PROMPTS
+from agents.router import log_routing_decision
+
+logger = get_logger(__name__)
+
 
 CRITIQUE_TOOL = {
     "type": "function",
     "function": {
-        "name": "evaluate_claims",
-        "description": "Evaluate factual claims in an agent's output",
+        "name": "critique_claims",
+        "description": "Identify and critique factual claims in agent outputs",
         "parameters": {
             "type": "object",
             "properties": {
@@ -22,16 +24,14 @@ CRITIQUE_TOOL = {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "span": {"type": "string"},
-                            "confidence": {
-                                "type": "number",
-                                "minimum": 0.0,
-                                "maximum": 1.0,
-                            },
-                            "flagged": {"type": "boolean"},
-                            "reason": {"type": "string"},
+                            "span_start": {"type": "integer"},
+                            "span_end": {"type": "integer"},
+                            "claim_text": {"type": "string"},
+                            "confidence": {"type": "number"},
+                            "disagreement": {"type": "string"},
+                            "source_agent": {"type": "string"},
                         },
-                        "required": ["span", "confidence", "flagged", "reason"],
+                        "required": ["span_start", "span_end", "claim_text", "confidence", "source_agent"],
                     },
                 },
             },
@@ -40,106 +40,64 @@ CRITIQUE_TOOL = {
     },
 }
 
-MAX_TOKENS = 6000
 
-
-async def critique_node(state: SharedContext) -> dict:
-    agent_id = "critique"
+async def run(state: SharedContext) -> dict:
     job_id = state.job_id
+    agent_id = "critique_node"
+    mgr = await get_manager(job_id)
+    await mgr.declare_budget(agent_id, 4000)
 
-    await budget_manager.declare_budget(agent_id, MAX_TOKENS)
+    try:
+        outputs_text = ""
+        for aid, output in state.agent_outputs.items():
+            outputs_text += f"\n\n[{aid}]: {output.output}"
 
-    new_claims = []
-    client = get_client()
+        prompt = AGENT_PROMPTS.get(agent_id, "")
+        response = await llm_call(
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": f"Agent outputs to critique:{outputs_text}"},
+            ],
+            tools=[CRITIQUE_TOOL],
+            tool_choice="required",
+        )
 
-    for output_agent_id, agent_output in state.agent_outputs.items():
-        output_text = agent_output.output
-        if not output_text:
-            continue
+        if not response.choices[0].message.tool_calls:
+            logger.error("critique_llm_no_tool_call", agent_id=agent_id)
+            return {
+                "routing_log": [{
+                    "from_node": agent_id,
+                    "to_node": "synthesis_node",
+                    "reasoning": "Critique LLM failed — skipping to synthesis",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }],
+            }
 
-        try:
-            response = await client.chat.completions.create(
-                model=settings.MODEL_NAME,  
-                tools=[CRITIQUE_TOOL],
-                tool_choice="required",
-                messages=[
-                    {"role": "system", "content": AGENT_PROMPTS["critique"]},
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Review the following output from agent '{output_agent_id}':\n\n"
-                            f"{output_text}"
-                        ),
-                    },
-                ],
-            )
-            
-            if not response.choices[0].message.tool_calls:
-                logger.error("critique_llm_no_tool_call", agent_id=agent_id, output_agent=output_agent_id)
-                continue
+        args = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
+        claims_raw = args.get("claims", [])
+        new_claims = [CritiquedClaim(**c) for c in claims_raw]
 
-            args = json.loads(
-                response.choices[0].message.tool_calls[0].function.arguments
-            )
-            await budget_manager.consume(
-                agent_id,
-                json.dumps(args),
-            )
-        except Exception as e:
-            logger.error("critique_llm_failed", agent_id=agent_id, error=str(e))
-            continue
-        raw_claims = args.get("claims", [])
-
-        for claim_dict in raw_claims:
-            span = claim_dict.get("span", "")
-            if span and span not in output_text:
-                logger.warning(
-                    "critique_span_not_substring",
-                    span=span[:60],
-                    agent=output_agent_id,
-                )
-                continue
-
-            new_claims.append(
-                CritiquedClaim(
-                    span=span,
-                    source_agent=output_agent_id,
-                    confidence=float(claim_dict.get("confidence", 0.0)),
-                    flagged=bool(claim_dict.get("flagged", False)),
-                    reason=claim_dict.get("reason", ""),
-                )
-            )
-
-    async def _write_event():
-        from db.queries import write_agent_event
-        from db import AsyncSessionLocal
-        async with AsyncSessionLocal() as session:
-            from db.queries import sha256_hex
-            await write_agent_event(
-                session=session,
-                job_id=uuid.UUID(job_id),
-                agent_id=agent_id,
-                event_type="agent_done",
-                input_hash=sha256_hex(list(state.agent_outputs.keys())),
-                output_hash=sha256_hex([c.span for c in new_claims]),
-                payload={
-                    "claims": [c.model_dump() for c in new_claims],
-                    "total_flagged": sum(1 for c in new_claims if c.flagged),
-                },
-            )
-
-    asyncio.create_task(_write_event())
-
-    return {
-        "critique_results": new_claims,
-        "routing_log": [{
-            "next": "synthesis_node",
-            "reason": f"Critiqued {len(new_claims)} claims, flagged {sum(1 for c in new_claims if c.flagged)}",
-            "agent": agent_id,
+        routing_entry = {
+            "from_node": agent_id,
+            "to_node": "synthesis_node",
+            "reasoning": f"Critiqued {len(new_claims)} claims",
             "timestamp": datetime.now(timezone.utc).isoformat(),
-        }],
-    }
+        }
+        await log_routing_decision(state, agent_id, "synthesis_node", f"Critiqued {len(new_claims)} claims")
 
+        return {
+            "critique_results": new_claims,
+            "routing_log": [routing_entry],
+        }
 
-
-
+    except BudgetExceededException as e:
+        logger.error("budget_exceeded", agent_id=agent_id, job_id=job_id)
+        return {
+            "compression_triggered": True,
+            "routing_log": [{
+                "from_node": agent_id,
+                "to_node": "compression_node",
+                "reasoning": f"Budget exceeded: {e}",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }],
+        }

@@ -1,8 +1,7 @@
-from core.config import settings
 import json
-from core.llm import get_client
-from tools.base import BaseTool
-from schemas.tool_result import ToolResult, ErrorCode
+from core.llm import llm_call
+from schemas.tool_result import ToolResult
+from schemas.context import AgentOutput
 
 REFLECTION_TOOL = {
     "type": "function",
@@ -17,19 +16,16 @@ REFLECTION_TOOL = {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "claim_a": {"type": "string"},
-                            "claim_b": {"type": "string"},
-                            "source_a": {"type": "string"},
-                            "source_b": {"type": "string"},
-                            "severity": {
-                                "type": "number",
-                                "minimum": 0.0,
-                                "maximum": 1.0,
-                            },
+                            "span_start": {"type": "integer"},
+                            "span_end": {"type": "integer"},
+                            "claim_text": {"type": "string"},
+                            "confidence": {"type": "number"},
+                            "disagreement": {"type": "string"},
+                            "source_agent": {"type": "string"},
                         },
                         "required": [
-                            "claim_a", "claim_b", "source_a",
-                            "source_b", "severity",
+                            "span_start", "span_end", "claim_text",
+                            "confidence", "source_agent",
                         ],
                     },
                 },
@@ -41,44 +37,49 @@ REFLECTION_TOOL = {
 
 REFLECTION_SYSTEM_PROMPT = """You are a contradiction detector. Examine agent outputs
 and tool call logs to find factual contradictions. For each pair of conflicting claims,
-report both claims, their source agents, and a severity score (0.0 = minor nuance,
-1.0 = direct contradiction on core facts). Only report genuine contradictions,
-not stylistic differences or paraphrasing."""
+report span_start, span_end (character offsets), claim_text, confidence (0.0-1.0),
+disagreement (None if accepted, or a string explaining the issue), and source_agent.
+Only report genuine contradictions, not stylistic differences."""
 
 
-class SelfReflectionTool(BaseTool):
+class SelfReflectionTool:
     name = "self_reflection"
-    timeout_seconds = 30.0
 
-    async def _execute(self, input: dict) -> ToolResult:
+    async def execute(self, input: dict) -> ToolResult:
         focus = input.get("focus", "")
         context = input.get("context", {})
 
         outputs_summary = []
-        for aid, ao in context.get("agent_outputs", {}).items():
-            outputs_summary.append(f"[{aid}]: {ao.get('output', str(ao))}")
+        agent_outputs = context.get("agent_outputs", {})
+        for aid, ao in agent_outputs.items():
+            output_text = ao.output if hasattr(ao, "output") else str(ao)
+            outputs_summary.append(f"[{aid}]: {output_text}")
 
         tool_summary = []
-        for tc in context.get("tool_call_log", []):
+        tool_call_log = context.get("tool_call_log", [])
+        for tc in tool_call_log:
+            tool_name = tc.tool_name if hasattr(tc, "tool_name") else "?"
+            tool_output = tc.output if hasattr(tc, "output") else {}
             tool_summary.append(
-                f"Tool '{tc.get('tool_name', '?')}': {json.dumps(tc.get('output', {}))[:500]}"
+                f"Tool '{tool_name}': {json.dumps(tool_output)[:500]}"
             )
 
         combined = (
             f"Focus: {focus}\n\n"
-            f"Agent outputs:\n" + "\n---\n".join(outputs_summary) + "\n\n"
-            f"Tool call results:\n" + "\n".join(tool_summary)
+            + "Agent outputs:\n"
+            + "\n---\n".join(outputs_summary)
+            + "\n\n"
+            + "Tool call results:\n"
+            + "\n".join(tool_summary)
         )
 
-        client = get_client()
-        response = await client.chat.completions.create(
-            model=settings.MODEL_NAME,
-            tools=[REFLECTION_TOOL],
-            tool_choice="required",
+        response = await llm_call(
             messages=[
                 {"role": "system", "content": REFLECTION_SYSTEM_PROMPT},
                 {"role": "user", "content": combined},
             ],
+            tools=[REFLECTION_TOOL],
+            tool_choice="required",
         )
 
         args = json.loads(
@@ -86,8 +87,8 @@ class SelfReflectionTool(BaseTool):
         )
 
         return ToolResult(
-            success=True,
-            data={"contradictions": args.get("contradictions", [])},
+            status="ok",
+            payload={"contradictions": args.get("contradictions", [])},
+            latency_ms=0.0,
+            retry_count=0,
         )
-
-

@@ -15,19 +15,19 @@ class QueryRequest(BaseModel):
 
 class QueryQueued(BaseModel):
     job_id: str
-    status: str
+    status: str = "queued"
 
 
 class TraceResponse(BaseModel):
     job_id: str
     status: str
     query: str
-    final_answer: str | None
-    agent_events: list[dict]
-    tool_calls: list[dict]
-    graph_edges: list[dict]
-    created_at: str | None
-    completed_at: str | None
+    final_answer: str | None = None
+    agent_events: list[dict] = []
+    tool_calls: list[dict] = []
+    graph_edges: list[dict] = []
+    created_at: str | None = None
+    completed_at: str | None = None
 
 
 class DimensionStats(BaseModel):
@@ -37,8 +37,8 @@ class DimensionStats(BaseModel):
 
 
 class EvalSummaryResponse(BaseModel):
-    run_group_id: str | None
-    timestamp: str | None
+    run_group_id: str | None = None
+    timestamp: str | None = None
     total_cases: int = 0
     by_category: dict[str, Any] = {}
     by_dimension: dict[str, DimensionStats] = {}
@@ -53,7 +53,7 @@ class ApproveRequest(BaseModel):
 class ApproveResponse(BaseModel):
     rewrite_id: str
     status: str
-    decided_at: str | None
+    decided_at: str | None = None
 
 
 class ReevalRequest(BaseModel):
@@ -63,6 +63,5 @@ class ReevalRequest(BaseModel):
 
 class ReevalResponse(BaseModel):
     reeval_job_id: str
-    test_cases: int
-    status: str
-
+    test_cases: int = 0
+    status: str = "queued"

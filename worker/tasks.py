@@ -3,7 +3,9 @@ import uuid as _uuid
 from datetime import datetime, UTC
 from arq.connections import RedisSettings
 from core.config import settings
-from core.logging import logger
+from core.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 async def process_query_job(ctx, job_id: str, query: str):
@@ -12,7 +14,9 @@ async def process_query_job(ctx, job_id: str, query: str):
     from schemas.context import SharedContext
     from db.queries import update_job_status
     from db import AsyncSessionLocal
+    from context_manager import get_manager, release_manager
 
+    mgr = await get_manager(job_id)
     r = aioredis.from_url(settings.REDIS_URL)
     channel = f"job:{job_id}"
 
@@ -50,15 +54,8 @@ async def process_query_job(ctx, job_id: str, query: str):
 
                 if "final_answer" in state_update and state_update["final_answer"]:
                     final_answer = state_update["final_answer"]
-
-                routing_log = state_update.get("routing_log", [])
-                for entry in routing_log or []:
-                    if isinstance(entry, dict):
-                        await publish("graph_edge", "orchestrator", entry)
-
-                if "final_answer" in state_update and state_update["final_answer"]:
                     await publish("agent_done", node_name, {
-                        "final_answer": state_update["final_answer"]
+                        "final_answer": final_answer,
                     })
                 elif "agent_outputs" in state_update:
                     for aid, output in state_update["agent_outputs"].items():
@@ -67,8 +64,10 @@ async def process_query_job(ctx, job_id: str, query: str):
                 else:
                     await publish("agent_start", node_name, {"node": node_name})
 
-                if "context_budget" in state_update:
-                    await publish("budget_update", node_name, state_update["context_budget"])
+                if "routing_log" in state_update:
+                    for entry in (state_update["routing_log"] or []):
+                        if isinstance(entry, dict):
+                            await publish("graph_edge", "orchestrator", entry)
 
         async with AsyncSessionLocal() as session:
             await update_job_status(
@@ -92,72 +91,44 @@ async def process_query_job(ctx, job_id: str, query: str):
         raise
     finally:
         await r.aclose()
+        await release_manager(job_id)
 
 
 async def run_eval_harness(ctx):
     from eval.harness import EvalHarness
     harness = EvalHarness()
-    await harness.run_all()
-    logger.info("eval_harness_complete", run_group_id=harness.run_group_id)
+    results = await harness.run_all()
+    logger.info("eval_harness_complete", run_group_id=harness.run_group_id, cases=len(results))
     return harness.run_group_id
 
 
 async def run_targeted_reeval(ctx, test_case_ids: list[str], rewrite_ids: list[str]):
-    from agents.prompts import AGENT_PROMPTS as original_prompts
+    import copy
     from agents.prompts import AGENT_PROMPTS
     from db.queries import get_rewrite_by_id
     from db import AsyncSessionLocal
     from eval.harness import EvalHarness
     from eval.test_cases import TEST_CASES
 
-    saved_prompts: dict[str, str] = {}
+    original_prompts = copy.deepcopy(AGENT_PROMPTS)
 
     if rewrite_ids:
         for rid in rewrite_ids:
             async with AsyncSessionLocal() as session:
                 rewrite = await get_rewrite_by_id(session, _uuid.UUID(rid))
-            if rewrite:
-                saved_prompts[rewrite.agent_id] = AGENT_PROMPTS.get(rewrite.agent_id, "")
+            if rewrite and rewrite.agent_id in AGENT_PROMPTS:
                 AGENT_PROMPTS[rewrite.agent_id] = rewrite.new_prompt
 
-    target_cases = [
-        tc for tc in TEST_CASES
-        if not test_case_ids or tc.id in test_case_ids
-    ]
-
+    target_cases = [tc for tc in TEST_CASES if not test_case_ids or tc.id in test_case_ids]
     harness = EvalHarness()
-    original_scores_by_case: dict[str, dict] = {}
 
     for tc in target_cases:
-        eval_run = await harness._run_one(tc)
-        if rewrite_ids and eval_run.scores:
-            delta = {
-                dim: round(v.get("score", 0.0), 3) if isinstance(v, dict) else round(float(v), 3)
-                for dim, v in eval_run.scores.items()
-            }
-            async with AsyncSessionLocal() as session:
-                for rid in rewrite_ids:
-                    from sqlalchemy import update
-                    from db.models import PromptRewrite
-                    await session.execute(
-                        update(PromptRewrite)
-                        .where(PromptRewrite.id == _uuid.UUID(rid))
-                        .values(
-                            performance_delta=delta,
-                            eval_run_id=eval_run.id,
-                        )
-                    )
-                await session.commit()
+        await harness._run_one(tc)
 
-    for agent_id, old_prompt in saved_prompts.items():
-        AGENT_PROMPTS[agent_id] = old_prompt
+    AGENT_PROMPTS.clear()
+    AGENT_PROMPTS.update(original_prompts)
 
-    logger.info(
-        "targeted_reeval_complete",
-        run_group_id=harness.run_group_id,
-        test_cases_run=len(target_cases),
-    )
-
+    logger.info("targeted_reeval_complete", run_group_id=harness.run_group_id, cases=len(target_cases))
     return str(harness.run_group_id)
 
 
@@ -166,4 +137,3 @@ class WorkerSettings:
     redis_settings = RedisSettings.from_dsn(settings.REDIS_URL)
     max_jobs = 10
     job_timeout = 600
-
