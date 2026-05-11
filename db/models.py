@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from sqlalchemy import Boolean, DateTime, Enum, Float, ForeignKey, Integer, String, Text, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 class Base(DeclarativeBase):
@@ -85,12 +85,18 @@ class EvalRun(Base):
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
     )
     run_group_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), index=True, nullable=False)
-    triggered_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    triggered_by: Mapped[str | None] = mapped_column(
+        Enum("manual", "reeval", name="eval_trigger", native_enum=True, create_type=False),
+        nullable=True
+    )
     timestamp: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
     test_case_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
-    category: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    category: Mapped[str | None] = mapped_column(
+        Enum("baseline", "ambiguous", "adversarial", name="eval_category", native_enum=True, create_type=False),
+        nullable=True
+    )
     query: Mapped[str | None] = mapped_column(Text, nullable=True)
     final_answer: Mapped[str | None] = mapped_column(Text, nullable=True)
     scores: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
@@ -108,17 +114,9 @@ class EvalCase(Base):
     eval_run_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("eval_runs.id"), index=True, nullable=False
     )
-    test_case_id: Mapped[str] = mapped_column(String(10), nullable=False)
-    category: Mapped[str] = mapped_column(
-        Enum("baseline", "ambiguous", "adversarial", name="eval_category", native_enum=True, create_type=False),
-        nullable=False
-    )
-    scores: Mapped[dict] = mapped_column(JSONB, default=dict)
-    tool_call_log: Mapped[dict] = mapped_column(JSONB, default=dict)
-    agent_outputs: Mapped[dict] = mapped_column(JSONB, default=dict)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    dimension: Mapped[str] = mapped_column(String(50), nullable=False)
+    score: Mapped[float] = mapped_column(Float, nullable=False)
+    justification: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class PromptRewrite(Base):
@@ -131,7 +129,7 @@ class PromptRewrite(Base):
     dimension: Mapped[str] = mapped_column(String(50), nullable=False)
     old_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
     new_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
-    diff: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    diff: Mapped[str | None] = mapped_column(Text, nullable=True)
     justification: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(
         Enum("pending", "approved", "rejected", name="rewrite_status", native_enum=True, create_type=False),
@@ -141,7 +139,7 @@ class PromptRewrite(Base):
     proposed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     decided_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    performance_delta: Mapped[float | None] = mapped_column(Float, nullable=True)
+    performance_delta: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     eval_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
 
 

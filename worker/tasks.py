@@ -77,15 +77,19 @@ async def process_query_job(ctx, job_id: str, query: str):
                             await publish("graph_edge", "orchestrator", entry)
 
         async with AsyncSessionLocal() as session:
-            await update_job_status(
-                session, _uuid.UUID(job_id), "done",
-                final_answer=final_answer or "",
-                completed_at=datetime.now(UTC),
-            )
-
-        await publish("job_done", "orchestrator", {
-            "final_answer": final_answer,
-        })
+            if final_answer is not None:
+                await update_job_status(
+                    session, _uuid.UUID(job_id), "done",
+                    final_answer=final_answer,
+                    completed_at=datetime.now(UTC),
+                )
+                await publish("job_done", "orchestrator", {
+                    "final_answer": final_answer,
+                })
+            else:
+                # If we finished but no final_answer was set, something went wrong in the nodes
+                await update_job_status(session, _uuid.UUID(job_id), "failed")
+                await publish("job_failed", "orchestrator", {"error": "Graph completed without producing a final answer."})
 
     except Exception as e:
         logger.error("job_failed", job_id=job_id, error=str(e))
@@ -121,10 +125,15 @@ async def run_targeted_reeval(ctx, test_case_ids: list[str], rewrite_ids: list[s
 
     if rewrite_ids:
         for rid in rewrite_ids:
-            async with AsyncSessionLocal() as session:
-                rewrite = await get_rewrite_by_id(session, _uuid.UUID(rid))
-            if rewrite and rewrite.agent_id in AGENT_PROMPTS:
-                AGENT_PROMPTS[rewrite.agent_id] = rewrite.new_prompt
+            try:
+                uid = _uuid.UUID(rid)
+                async with AsyncSessionLocal() as session:
+                    rewrite = await get_rewrite_by_id(session, uid)
+                if rewrite and rewrite.agent_id in AGENT_PROMPTS:
+                    AGENT_PROMPTS[rewrite.agent_id] = rewrite.new_prompt
+            except ValueError:
+                logger.warning("invalid_rewrite_id_skipped", rewrite_id=rid)
+                continue
 
     target_cases = [tc for tc in TEST_CASES if not test_case_ids or tc.id in test_case_ids]
     harness = EvalHarness()
@@ -143,4 +152,4 @@ class WorkerSettings:
     functions = [process_query_job, run_eval_harness, run_targeted_reeval]
     redis_settings = RedisSettings.from_dsn(settings.REDIS_URL)
     max_jobs = 10
-    job_timeout = 600
+    job_timeout = 1200

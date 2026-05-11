@@ -20,7 +20,7 @@ def sha256_hex(data: dict | str) -> str:
 async def create_job(session: AsyncSession, job_id: uuid.UUID, query: str) -> Job:
     from sqlalchemy import text
     result = await session.execute(
-        text("INSERT INTO jobs (id, query, status) VALUES (:id, :query, 'pending'::job_status) RETURNING created_at"),
+        text("INSERT INTO jobs (id, query, status) VALUES (:id, :query, CAST('pending' AS job_status)) RETURNING created_at"),
         {"id": job_id, "query": query}
     )
     row = result.fetchone()
@@ -41,11 +41,11 @@ async def update_job_status(
     from sqlalchemy import text
     completed_val = completed_at or datetime.now(UTC)
     if status in ("done", "failed"):
-        sql = f"UPDATE jobs SET status = '{status}'::job_status, completed_at = :completed_at, final_answer = COALESCE(:final_answer, final_answer) WHERE id = :job_id"
-        await session.execute(text(sql), {"completed_at": completed_val, "final_answer": final_answer, "job_id": job_id})
+        sql = "UPDATE jobs SET status = CAST(:status AS job_status), completed_at = :completed_at, final_answer = COALESCE(:final_answer, final_answer) WHERE id = :job_id"
+        await session.execute(text(sql), {"status": status, "completed_at": completed_val, "final_answer": final_answer, "job_id": job_id})
     else:
-        sql = f"UPDATE jobs SET status = '{status}'::job_status, final_answer = COALESCE(:final_answer, final_answer) WHERE id = :job_id"
-        await session.execute(text(sql), {"final_answer": final_answer, "job_id": job_id})
+        sql = "UPDATE jobs SET status = CAST(:status AS job_status), final_answer = COALESCE(:final_answer, final_answer) WHERE id = :job_id"
+        await session.execute(text(sql), {"status": status, "final_answer": final_answer, "job_id": job_id})
     await session.commit()
 
 
@@ -183,14 +183,19 @@ async def get_eval_run(session: AsyncSession, run_id: uuid.UUID) -> EvalRun | No
 
 
 async def get_latest_eval_runs(session: AsyncSession) -> list[EvalRun]:
-    subquery = (
+    latest_group_stmt = (
         select(EvalRun.run_group_id)
         .order_by(EvalRun.timestamp.desc())
         .limit(1)
-        .scalar_subquery()
     )
+    latest_group_res = await session.execute(latest_group_stmt)
+    group_id = latest_group_res.scalar_one_or_none()
+
+    if not group_id:
+        return []
+
     result = await session.execute(
-        select(EvalRun).where(EvalRun.run_group_id == subquery)
+        select(EvalRun).where(EvalRun.run_group_id == group_id)
     )
     return list(result.scalars().all())
 
@@ -227,11 +232,12 @@ async def get_latest_approved_prompt(session: AsyncSession, agent_id: str) -> Pr
 
 
 async def get_pending_rewrites(session: AsyncSession) -> list[PromptRewrite]:
-    from sqlalchemy import text
     result = await session.execute(
-        text("SELECT * FROM prompt_rewrites WHERE status = 'pending' ORDER BY proposed_at")
+        select(PromptRewrite)
+        .where(PromptRewrite.status == "pending")
+        .order_by(PromptRewrite.proposed_at.asc())
     )
-    return [PromptRewrite(**dict(row._mapping)) for row in result.fetchall()]
+    return list(result.scalars().all())
 
 
 async def approve_rewrite(

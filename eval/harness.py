@@ -30,7 +30,7 @@ class EvalHarness:
     async def _run_one(self, tc: TestCase):
         from db import AsyncSessionLocal
         from db.models import EvalRun, EvalCase
-        from db.queries import get_agent_events, save_eval_run, save_eval_cases, create_job
+        from db.queries import get_agent_events, create_job
 
         job_id = str(_uuid.uuid4())
         initial = SharedContext(job_id=job_id, original_query=tc.query)
@@ -89,23 +89,25 @@ class EvalHarness:
             query=tc.query,
             final_answer=final_answer,
             scores=scores,
+            tool_calls={"calls": tool_calls_snapshot},
             job_id=_uuid.UUID(job_id),
         )
 
-        eval_case = EvalCase(
-            eval_run_id=eval_run.id,
-            test_case_id=tc.id,
-            category=tc.category,
-            scores=scores,
-            tool_call_log=tool_calls_snapshot,
-            agent_outputs=agent_outputs_snapshot,
-        )
+        eval_cases = []
+        for dim, sd in scores.items():
+            eval_cases.append(EvalCase(
+                eval_run_id=eval_run.id,
+                dimension=dim,
+                score=sd.get("score", 0.0) if isinstance(sd, dict) else float(sd),
+                justification=sd.get("justification", "") if isinstance(sd, dict) else "",
+            ))
 
         async with AsyncSessionLocal() as session:
             session.add(eval_run)
             await session.flush()
-            eval_case.eval_run_id = eval_run.id
-            session.add(eval_case)
+            for ec in eval_cases:
+                ec.eval_run_id = eval_run.id
+                session.add(ec)
             await session.commit()
             await session.refresh(eval_run)
 

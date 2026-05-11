@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     CHROMA_PERSIST_DIR: str = "/data/chroma"
 
     CODE_SANDBOX_TIMEOUT_SEC: int = 10
+    LLM_TIMEOUT_SEC: int = 120
 
     LOG_LEVEL: str = "INFO"
 

@@ -11,6 +11,7 @@ def get_llm_client() -> AsyncOpenAI:
         _llm_client = AsyncOpenAI(
             base_url=settings.OLLAMA_BASE_URL,
             api_key=settings.OLLAMA_API_KEY,
+            timeout=settings.LLM_TIMEOUT_SEC,
         )
     return _llm_client
 
