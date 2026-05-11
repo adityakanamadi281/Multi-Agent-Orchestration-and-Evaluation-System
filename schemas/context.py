@@ -28,6 +28,8 @@ class AgentOutput(BaseModel):
     output: str
     citations: list[dict] = []
     metadata: dict = Field(default_factory=dict)
+    latency_ms: float = 0.0
+    token_count: int = 0
 
 
 class ToolCall(BaseModel):
@@ -46,6 +48,8 @@ class RoutingEntry(BaseModel):
     to_node: str
     reasoning: str
     timestamp: str
+    latency_ms: float = 0.0
+    token_count: int = 0
 
 
 class SharedContext(BaseModel):

@@ -1,4 +1,5 @@
 import json
+import time
 from datetime import datetime, timezone
 from context_manager import get_manager
 from context_manager.budget import BudgetExceededException
@@ -6,7 +7,7 @@ from core.llm import llm_call
 from core.logging import get_logger
 from schemas.context import SharedContext, CritiquedClaim
 from agents.prompts import AGENT_PROMPTS
-from agents.router import log_routing_decision
+from agents.router import log_routing_decision, log_agent_done
 
 logger = get_logger(__name__)
 
@@ -53,6 +54,7 @@ async def run(state: SharedContext) -> dict:
             outputs_text += f"\n\n[{aid}]: {output.output}"
 
         prompt = AGENT_PROMPTS.get(agent_id, "")
+        start_time = time.perf_counter()
         response = await llm_call(
             messages=[
                 {"role": "system", "content": prompt},
@@ -61,6 +63,8 @@ async def run(state: SharedContext) -> dict:
             tools=[CRITIQUE_TOOL],
             tool_choice="required",
         )
+        latency_ms = (time.perf_counter() - start_time) * 1000
+        token_count = response.usage.total_tokens if hasattr(response, "usage") else 0
 
         if not response.choices[0].message.tool_calls:
             logger.error("critique_llm_no_tool_call", agent_id=agent_id)
@@ -77,13 +81,26 @@ async def run(state: SharedContext) -> dict:
         claims_raw = args.get("claims", [])
         new_claims = [CritiquedClaim(**c) for c in claims_raw]
 
+        reasoning = f"Critiqued {len(new_claims)} claims"
         routing_entry = {
             "from_node": agent_id,
             "to_node": "synthesis_node",
-            "reasoning": f"Critiqued {len(new_claims)} claims",
+            "reasoning": reasoning,
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "latency_ms": latency_ms,
+            "token_count": token_count,
         }
-        await log_routing_decision(state, agent_id, "synthesis_node", f"Critiqued {len(new_claims)} claims")
+        
+        from db.queries import sha256_hex
+        await log_agent_done(
+            state=state,
+            agent_id=agent_id,
+            output_hash=sha256_hex(args),
+            payload=args,
+            latency_ms=latency_ms,
+            token_count=token_count
+        )
+        await log_routing_decision(state, agent_id, "synthesis_node", reasoning, latency_ms=latency_ms, token_count=token_count)
 
         return {
             "critique_results": new_claims,

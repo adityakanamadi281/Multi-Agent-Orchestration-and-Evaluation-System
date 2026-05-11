@@ -1,6 +1,7 @@
 import asyncio
 import json
 import uuid
+import time
 from datetime import UTC, datetime
 
 from agents.prompts import AGENT_PROMPTS
@@ -10,6 +11,7 @@ from core.llm import get_llm_client as get_client
 from core.logging import get_logger
 logger = get_logger(__name__)
 from schemas.context import SharedContext
+from agents.router import log_agent_done, log_routing_decision
 
 COMPRESSION_TOOL = {
     "type": "function",
@@ -81,6 +83,7 @@ async def run(state: SharedContext) -> dict:
     client = get_client()
 
     try:
+        start_time = time.perf_counter()
         response = await client.chat.completions.create(
             model=settings.MODEL_NAME,
             tools=[COMPRESSION_TOOL],
@@ -96,6 +99,8 @@ async def run(state: SharedContext) -> dict:
                 },
             ],
         )
+        latency_ms = (time.perf_counter() - start_time) * 1000
+        token_count = response.usage.total_tokens if hasattr(response, "usage") else 0
     except Exception as e:
         logger.error("compression_llm_failed", agent_id=agent_id, error=str(e))
         return {
@@ -112,38 +117,34 @@ async def run(state: SharedContext) -> dict:
     )
     compressed = args.get("compressed_entries", [])
 
-    async def _write_event():
-        from db import AsyncSessionLocal
-        from db.queries import write_agent_event, sha256_hex
-        async with AsyncSessionLocal() as session:
-            try:
-                await write_agent_event(
-                    session=session,
-                    job_id=uuid.UUID(job_id),
-                    agent_id=agent_id,
-                    event_type="agent_done",
-                    input_hash=sha256_hex({"overflowing_agent": overflowing_agent}),
-                    output_hash=sha256_hex({"compressed_count": len(compressed)}),
-                    payload={
-                        "overflowing_agent": overflowing_agent,
-                        "compressed_entries": compressed,
-                        "token_reduction_pct": args.get("token_reduction_pct", 0),
-                    },
-                )
-            except Exception:
-                pass
+    from db.queries import sha256_hex
+    payload = {
+        "overflowing_agent": overflowing_agent,
+        "compressed_entries": compressed,
+        "token_reduction_pct": args.get("token_reduction_pct", 0),
+    }
+    await log_agent_done(
+        state=state,
+        agent_id=agent_id,
+        output_hash=sha256_hex({"compressed_count": len(compressed)}),
+        payload=payload,
+        latency_ms=latency_ms,
+        token_count=token_count,
+        input_hash=sha256_hex({"overflowing_agent": overflowing_agent})
+    )
 
-    asyncio.create_task(_write_event())
+    reasoning = (
+        f"Compressed routing_log for {overflowing_agent}, "
+        f"reduced {args.get('token_reduction_pct', 0):.0f}%"
+    )
+    await log_routing_decision(state, agent_id, "rag_node", reasoning, latency_ms=latency_ms, token_count=token_count)
 
     return {
         "context_budget": {},
         "routing_log": [{"_replace_all": True}] + compressed + [{
             "from_node": agent_id,
             "to_node": "rag_node",
-            "reasoning": (
-                f"Compressed routing_log for {overflowing_agent}, "
-                f"reduced {args.get('token_reduction_pct', 0):.0f}%"
-            ),
+            "reasoning": reasoning,
             "timestamp": datetime.now(UTC).isoformat(),
         }],
     }

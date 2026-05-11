@@ -56,6 +56,8 @@ async def process_query_job(ctx, job_id: str, query: str):
                     final_answer = state_update["final_answer"]
                     await publish("agent_done", node_name, {
                         "final_answer": final_answer,
+                        "latency_ms": state_update.get("latency_ms", 0.0),
+                        "token_count": state_update.get("token_count", 0),
                     })
                 elif "agent_outputs" in state_update:
                     for aid, output in state_update["agent_outputs"].items():
@@ -67,6 +69,11 @@ async def process_query_job(ctx, job_id: str, query: str):
                 if "routing_log" in state_update:
                     for entry in (state_update["routing_log"] or []):
                         if isinstance(entry, dict):
+                            # Ensure entry has latency and tokens if they were passed in state_update but not in entry
+                            if "latency_ms" not in entry and "latency_ms" in state_update:
+                                entry["latency_ms"] = state_update["latency_ms"]
+                            if "token_count" not in entry and "token_count" in state_update:
+                                entry["token_count"] = state_update["token_count"]
                             await publish("graph_edge", "orchestrator", entry)
 
         async with AsyncSessionLocal() as session:

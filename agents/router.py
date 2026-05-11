@@ -44,7 +44,7 @@ async def orchestrator_router(state: SharedContext) -> str:
     return "rag_node"
 
 
-async def log_routing_decision(state: SharedContext, from_node: str, to_node: str, reasoning: str):
+async def log_routing_decision(state: SharedContext, from_node: str, to_node: str, reasoning: str, latency_ms: float = 0.0, token_count: int = 0):
     entry = RoutingEntry(
         from_node=from_node,
         to_node=to_node,
@@ -62,6 +62,27 @@ async def log_routing_decision(state: SharedContext, from_node: str, to_node: st
                 event_type="graph_edge",
                 input_hash=sha256_hex({"from": from_node, "to": to_node}),
                 output_hash=sha256_hex({"reasoning": reasoning}),
+                latency_ms=latency_ms,
+                token_count=token_count,
                 payload={"from_node": from_node, "to_node": to_node, "reasoning": reasoning},
+            )
+    asyncio.create_task(_write())
+
+
+async def log_agent_done(state: SharedContext, agent_id: str, output_hash: str, payload: dict, latency_ms: float = 0.0, token_count: int = 0, input_hash: str | None = None):
+    async def _write():
+        from db.queries import write_agent_event, sha256_hex
+        from db import AsyncSessionLocal
+        async with AsyncSessionLocal() as session:
+            await write_agent_event(
+                session=session,
+                job_id=uuid.UUID(state.job_id),
+                agent_id=agent_id,
+                event_type="agent_done",
+                input_hash=input_hash or sha256_hex(state.original_query),
+                output_hash=output_hash,
+                latency_ms=latency_ms,
+                token_count=token_count,
+                payload=payload,
             )
     asyncio.create_task(_write())

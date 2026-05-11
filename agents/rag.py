@@ -1,5 +1,6 @@
 import json
 import asyncio
+import time
 from datetime import datetime, timezone
 from context_manager import get_manager
 from context_manager.budget import BudgetExceededException
@@ -8,7 +9,7 @@ from core.logging import get_logger
 from schemas.context import SharedContext, AgentOutput
 from agents.prompts import AGENT_PROMPTS
 from agents.rag_chunks import RAG_TOOL, _get_knowledge_chunks
-from agents.router import log_routing_decision
+from agents.router import log_routing_decision, log_agent_done
 from tools.web_search import WebSearchTool
 
 logger = get_logger(__name__)
@@ -43,6 +44,7 @@ async def run(state: SharedContext) -> dict:
                 combined_context += "\n\n" + web_text
 
         prompt = AGENT_PROMPTS.get(agent_id, "")
+        start_time = time.perf_counter()
         response = await llm_call(
             messages=[
                 {"role": "system", "content": prompt},
@@ -51,6 +53,8 @@ async def run(state: SharedContext) -> dict:
             tools=[RAG_TOOL],
             tool_choice="required",
         )
+        latency_ms = (time.perf_counter() - start_time) * 1000
+        token_count = response.usage.total_tokens if hasattr(response, "usage") else 0
 
         if not response.choices[0].message.tool_calls:
             return {
@@ -75,13 +79,26 @@ async def run(state: SharedContext) -> dict:
             for c in citations_raw
         ]
 
+        reasoning = f"RAG produced answer with {len(citations)} citations"
         routing_entry = {
             "from_node": agent_id,
             "to_node": "critique_node",
-            "reasoning": f"RAG produced answer with {len(citations)} citations",
+            "reasoning": reasoning,
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "latency_ms": latency_ms,
+            "token_count": token_count,
         }
-        await log_routing_decision(state, agent_id, "critique_node", f"RAG produced answer with {len(citations)} citations")
+        
+        from db.queries import sha256_hex
+        await log_agent_done(
+            state=state,
+            agent_id=agent_id,
+            output_hash=sha256_hex(answer),
+            payload=args,
+            latency_ms=latency_ms,
+            token_count=token_count
+        )
+        await log_routing_decision(state, agent_id, "critique_node", reasoning, latency_ms=latency_ms, token_count=token_count)
 
         return {
             "agent_outputs": {
@@ -89,6 +106,8 @@ async def run(state: SharedContext) -> dict:
                     agent_id=agent_id,
                     output=answer,
                     citations=citations,
+                    latency_ms=latency_ms,
+                    token_count=token_count,
                 )
             },
             "routing_log": [routing_entry],

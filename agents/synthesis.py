@@ -1,6 +1,7 @@
 import asyncio
 import json
 import uuid
+import time
 from datetime import UTC, datetime
 
 from agents.prompts import AGENT_PROMPTS
@@ -10,6 +11,7 @@ from core.llm import get_llm_client as get_client
 from core.logging import get_logger
 logger = get_logger(__name__)
 from schemas.context import SharedContext
+from agents.router import log_routing_decision, log_agent_done
 
 SYNTHESIS_TOOL = {
     "type": "function",
@@ -83,6 +85,7 @@ async def run(state: SharedContext) -> dict:
     client = get_client()
 
     try:
+        start_time = time.perf_counter()
         response = await client.chat.completions.create(
             model=settings.MODEL_NAME,
             tools=[SYNTHESIS_TOOL],
@@ -102,6 +105,8 @@ async def run(state: SharedContext) -> dict:
             ],
             max_tokens=MAX_TOKENS,
         )
+        latency_ms = (time.perf_counter() - start_time) * 1000
+        token_count = response.usage.total_tokens if hasattr(response, "usage") else 0
 
         message = response.choices[0].message
         if message.tool_calls:
@@ -139,22 +144,26 @@ async def run(state: SharedContext) -> dict:
                 job_id=job_id,
             )
 
-    async def _write_event():
+    from db.queries import sha256_hex
+    await log_agent_done(
+        state=state,
+        agent_id=agent_id,
+        output_hash=sha256_hex(args.get("final_answer", "")),
+        payload=args,
+        latency_ms=latency_ms,
+        token_count=token_count
+    )
+
+    reasoning = f"Synthesis complete with {len(resolved_spans)} contradictions resolved"
+    await log_routing_decision(state, agent_id, "END", reasoning, latency_ms=latency_ms, token_count=token_count)
+
+    # Update job final answer separately as synthesis is the end
+    async def _update_job():
         from db import AsyncSessionLocal
-        from db.queries import write_agent_event, sha256_hex
+        from sqlalchemy import update
+        from db.models import Job
         async with AsyncSessionLocal() as session:
-            from sqlalchemy import update
-            from db.models import Job
             try:
-                await write_agent_event(
-                    session=session,
-                    job_id=uuid.UUID(job_id),
-                    agent_id=agent_id,
-                    event_type="agent_done",
-                    input_hash=sha256_hex(list(outputs_summary.keys())),
-                    output_hash=sha256_hex(args.get("final_answer", "")),
-                    payload=args,
-                )
                 await session.execute(
                     update(Job)
                     .where(Job.id == uuid.UUID(job_id))
@@ -162,17 +171,20 @@ async def run(state: SharedContext) -> dict:
                 )
                 await session.commit()
             except Exception as e:
-                logger.warning("failed_to_write_synthesis_event", job_id=job_id, error=str(e))
-
-    asyncio.create_task(_write_event())
+                logger.warning("failed_to_update_job_final_answer", job_id=job_id, error=str(e))
+    asyncio.create_task(_update_job())
 
     return {
         "final_answer": args.get("final_answer"),
         "provenance_map": args.get("provenance_map", {}),
+        "latency_ms": latency_ms,
+        "token_count": token_count,
         "routing_log": [{
             "from_node": agent_id,
             "to_node": "END",
-            "reasoning": f"Synthesis complete with {len(resolved_spans)} contradictions resolved",
+            "reasoning": reasoning,
             "timestamp": datetime.now(UTC).isoformat(),
+            "latency_ms": latency_ms,
+            "token_count": token_count,
         }],
     }
